@@ -121,34 +121,42 @@ def collect(name, code):
         price_tag = soup.find("span", id="svdMainChartTxt11")
         result["현재가"] = _num(price_tag.get_text(strip=True)) if price_tag else None
 
-    # ── 투자자별 순매수 (네이버 증권 API)
+    # ── 투자자별 순매수 (네이버 m.stock investorByDay API)
     try:
         import requests as _req
+        from datetime import datetime as _dt
+        _biz = _dt.today().strftime("%Y%m%d")
         _ir = _req.get(
-            f"https://m.stock.naver.com/api/stock/{code}/investor",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5
+            f"https://m.stock.naver.com/api/stock/{code}/investorByDay?bizdate={_biz}",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=6
         )
-        _id = _ir.json()
-        # 당일 투자자별 순매수 (거래대금 기준, 억원)
-        def _parse_inv(val):
-            try: return round(int(str(val).replace(",","")) / 1e8, 1)
-            except: return None
-        result["투자자"] = {
-            "외국인_순매수": _parse_inv(_id.get("foreignerNetBuying")),
-            "기관_순매수":   _parse_inv(_id.get("organNetBuying")),
-            "개인_순매수":   _parse_inv(_id.get("individualNetBuying")),
-            "외국인_매수":   _parse_inv(_id.get("foreignerBuying")),
-            "외국인_매도":   _parse_inv(_id.get("foreignerSelling")),
-            "기관_매수":     _parse_inv(_id.get("organBuying")),
-            "기관_매도":     _parse_inv(_id.get("organSelling")),
-            "개인_매수":     _parse_inv(_id.get("individualBuying")),
-            "개인_매도":     _parse_inv(_id.get("individualSelling")),
-            "_raw_keys":     list(_id.keys())[:15],  # 디버깅용
-        }
+        if _ir.status_code == 200:
+            _id = _ir.json()
+            # 응답이 리스트인 경우 당일(첫 번째) 데이터 사용
+            if isinstance(_id, list) and _id:
+                _id = _id[0]
+            def _to_억(v):
+                try: return round(int(str(v).replace(",","")) / 1e8, 1)
+                except: return None
+            result["투자자"] = {
+                "_raw_keys": list(_id.keys())[:20],
+                "외국인_순매수": _to_억(_id.get("foreignerNetBuyPrice") or _id.get("foreignerNet") or _id.get("frgNetBuyAmt")),
+                "기관_순매수":   _to_억(_id.get("organNetBuyPrice")    or _id.get("organNet")    or _id.get("orgNetBuyAmt")),
+                "개인_순매수":   _to_억(_id.get("individualNetBuyPrice") or _id.get("individualNet") or _id.get("indNetBuyAmt")),
+                "외국인_매수":   _to_억(_id.get("foreignerBuyPrice")  or _id.get("foreignerBuy")),
+                "외국인_매도":   _to_억(_id.get("foreignerSellPrice") or _id.get("foreignerSell")),
+                "기관_매수":     _to_억(_id.get("organBuyPrice")      or _id.get("organBuy")),
+                "기관_매도":     _to_억(_id.get("organSellPrice")     or _id.get("organSell")),
+                "개인_매수":     _to_억(_id.get("individualBuyPrice") or _id.get("individualBuy")),
+                "개인_매도":     _to_억(_id.get("individualSellPrice") or _id.get("individualSell")),
+            }
+        else:
+            result["투자자"] = {"_status": _ir.status_code}
     except Exception as _e:
-        result["투자자"] = {}
+        result["투자자"] = {"_error": str(_e)}
 
+    # ── 모든 테이블 파싱
     parsed = [_parse_table(tbl) for tbl in all_tables]
 
     # ── 베타, 발행주식수: 내용으로 테이블 탐색
@@ -472,20 +480,6 @@ def collect(name, code):
                     return [_num(td.get_text(strip=True)) for td in tr.find_all("td")]
             return []
 
-        def _get_row_vals_last(div_id: str, label: str) -> list:
-            """동일 레이블 행 중 값이 있는 마지막 행 반환 (배당금지급 등 중복 행 대응)"""
-            div = fin_soup.find("div", id=div_id)
-            if not div: return []
-            result = []
-            for tr in div.find_all("tr"):
-                th = tr.find("th")
-                if not th: continue
-                if label in th.get_text(strip=True).replace(" ",""):
-                    vals = [_num(td.get_text(strip=True)) for td in tr.find_all("td")]
-                    if any(v is not None for v in vals):
-                        result = vals  # 값 있으면 계속 갱신 → 마지막 유효 행
-            return result
-
         def _get_years(div_id: str) -> list:
             div = fin_soup.find("div", id=div_id)
             if not div: return []
@@ -502,21 +496,11 @@ def collect(name, code):
         if not pretax_profit:
             pretax_profit = _get_row_vals("divSonikY", "법인세비용차감전")
 
-        # 현금흐름표 연간 (divCashY) - 영업CF, 배당금지급
-        cf_years  = _get_years("divCashY")
-        oper_cf   = _get_row_vals("divCashY", "영업활동으로인한현금흐름")
-        # 배당금지급(-) 행이 여러 개 → 값 있는 마지막 행
-        div_paid  = _get_row_vals_last("divCashY", "배당금지급(-)")
-        if not div_paid:
-            div_paid = _get_row_vals_last("divCashY", "배당금지급")
-
         d["finance"] = {
-            "years":           bs_years,
-            "단기차입금":      short_borrow[:len(bs_years)],
-            "이익잉여금":      retained[:len(bs_years)],
+            "years":          bs_years,
+            "단기차입금":     short_borrow[:len(bs_years)],
+            "이익잉여금":     retained[:len(bs_years)],
             "세전계속사업이익": pretax_profit[:len(bs_years)],
-            "영업CF":          oper_cf[:len(cf_years)] if oper_cf else [],
-            "배당금지급":      div_paid[:len(cf_years)] if div_paid else [],
         }
         print(f"  Finance 수집: 단기차입금{short_borrow[-1:]}, 이익잉여금{retained[-1:]}, 세전{pretax_profit[-1:]}")
     except Exception as e:
