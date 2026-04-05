@@ -142,6 +142,7 @@ def _run_job(job_id: str, stock_name: str):
 
 
 def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
+    """주요 지표 + 배당성향 + 투자자별 순매수 + 배지"""
     def _last(lst):
         return next((v for v in reversed(lst or []) if v is not None), None)
 
@@ -150,19 +151,19 @@ def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
     roa = _last(ann.get("ROA",[])); dps = _last(ann.get("DPS",[]))
     배당수익률 = data.get("배당수익률")
 
-    # 배당성향
+    # 배당성향 = DPS / EPS × 100
     배당성향 = round(dps / eps * 100, 1) if dps and eps and eps > 0 else None
 
-    # 배당 연속
+    # 배당 연속 여부
     dps_list = [v for v in (ann.get("DPS") or [])[-3:] if v is not None]
     배당여부   = bool(dps and dps > 0)
     배당3년연속 = len(dps_list) >= 3 and all(v > 0 for v in dps_list)
 
-    # DCF
+    # DCF (영업CF 기반)
     dcf_per_share = dcf_판정 = None
     try:
-        fin  = data.get("finance", {})
-        cfs  = [v for v in (fin.get("영업CF") or []) if v and v > 0]
+        fin = data.get("finance", {})
+        cfs = [v for v in (fin.get("영업CF") or []) if v and v > 0]
         shrx = data.get("발행주식수_보통", 0) or 0
         if cfs and shrx > 0 and ke > 0:
             recent = cfs[-3:]; w = list(range(1, len(recent)+1))
@@ -177,14 +178,12 @@ def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
     except Exception:
         pass
 
-    # 판정
     def _j(v, lo, hi, rev=False):
         if v is None: return None
         ok = v < lo if not rev else v > hi
         ng = v > hi if not rev else v < lo
         return "저평가" if ok else "고평가" if ng else "적정"
 
-    # 투자자
     inv = data.get("투자자", {})
 
     return {
@@ -198,12 +197,9 @@ def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
         "외국인순매수": inv.get("외국인_순매수"),
         "기관순매수":   inv.get("기관_순매수"),
         "개인순매수":   inv.get("개인_순매수"),
-        "외국인매수":   inv.get("외국인_매수"),
-        "외국인매도":   inv.get("외국인_매도"),
-        "기관매수":     inv.get("기관_매수"),
-        "기관매도":     inv.get("기관_매도"),
-        "개인매수":     inv.get("개인_매수"),
-        "개인매도":     inv.get("개인_매도"),
+        "외국인매수":   inv.get("외국인_매수"), "외국인매도": inv.get("외국인_매도"),
+        "기관매수":     inv.get("기관_매수"),   "기관매도":   inv.get("기관_매도"),
+        "개인매수":     inv.get("개인_매수"),   "개인매도":   inv.get("개인_매도"),
         "PER판정": _j(per, 10, 25), "PBR판정": _j(pbr, 1.0, 3.0),
         "EV판정":  _j(ev, 6, 15),  "DCF판정": dcf_판정,
         "배당판정": _j(배당수익률, 2.0, 999, rev=True) if 배당수익률 else None,
@@ -477,24 +473,31 @@ def api_shutdown():
 
 @app.route("/api/stocklist")
 def api_stocklist():
-    """자동완성용 종목 리스트 반환"""
+    """자동완성용 종목 리스트"""
     try:
         sys.path.insert(0, str(BASE))
         import stock_search as _ss
         importlib.reload(_ss)
-        stocks = _ss.load_stock_list()   # [(name, code, market), ...]
+        # stock_search.py의 load_stock_list() 또는 검색 함수 활용
+        cache = BASE / "WORK" / "stock_list.json"
+        if cache.exists():
+            import json as _json
+            lst = _json.loads(cache.read_text(encoding="utf-8"))
+            # 형식 통일: [{"name":..,"code":..,"market":..}, ...]
+            result = []
+            for item in lst:
+                if isinstance(item, dict):
+                    result.append(item)
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    result.append({"name": item[0], "code": item[1],
+                                   "market": item[2] if len(item) > 2 else ""})
+            return jsonify({"list": result})
+        # 캐시 없으면 stock_search에서 직접 로딩
+        stocks = getattr(_ss, "load_stock_list", lambda: [])()
         result = [{"name": s[0], "code": s[1], "market": s[2] if len(s) > 2 else ""}
                   for s in stocks]
         return jsonify({"list": result})
     except Exception as e:
-        # stock_search 구조가 다를 경우 대비
-        try:
-            cache = BASE / "WORK" / "stock_list.json"
-            if cache.exists():
-                lst = json.loads(cache.read_text(encoding="utf-8"))
-                return jsonify({"list": lst})
-        except Exception:
-            pass
         return jsonify({"list": [], "error": str(e)})
 
 
