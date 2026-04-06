@@ -86,7 +86,20 @@ def _run_job(job_id: str, stock_name: str):
         except Exception:
             pass
 
-        # JSON 저장
+        # JSON 저장 전 None 값 보정 (금융주 등 최신연도 BPS/ROE가 None인 경우)
+        def _fill_none_prev(lst):
+            """None 항목을 직전 유효값으로 대체"""
+            result, last = [], None
+            for v in (lst or []):
+                if v is not None: last = v
+                result.append(last)
+            return result
+
+        ann_data = data.get("annual", {})
+        for key in ["BPS", "ROE", "자본총계", "지배주주지분", "자본금", "EPS"]:
+            if key in ann_data and isinstance(ann_data[key], list):
+                ann_data[key] = _fill_none_prev(ann_data[key])
+
         work_dir = BASE / "WORK"
         work_dir.mkdir(exist_ok=True)
         json_path = work_dir / f"{code}_{found_name}.json"
@@ -139,71 +152,6 @@ def _run_job(job_id: str, stock_name: str):
         print(f"[오류] job {job_id}: {e}\n{tb}")
         with _lock:
             _status[job_id] = {"state": "error", "msg": str(e), "trace": tb}
-
-
-def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
-    """주요 지표 + 배당성향 + 투자자별 순매수 + 배지"""
-    def _last(lst):
-        return next((v for v in reversed(lst or []) if v is not None), None)
-
-    per = data.get("PER"); pbr = data.get("PBR"); ev = data.get("EV_EBITDA")
-    eps = _last(ann.get("EPS",[])); bps = _last(ann.get("BPS",[]))
-    roa = _last(ann.get("ROA",[])); dps = _last(ann.get("DPS",[]))
-    배당수익률 = data.get("배당수익률")
-
-    # 배당성향 = DPS / EPS × 100
-    배당성향 = round(dps / eps * 100, 1) if dps and eps and eps > 0 else None
-
-    # 배당 연속 여부
-    dps_list = [v for v in (ann.get("DPS") or [])[-3:] if v is not None]
-    배당여부   = bool(dps and dps > 0)
-    배당3년연속 = len(dps_list) >= 3 and all(v > 0 for v in dps_list)
-
-    # DCF (영업CF 기반)
-    dcf_per_share = dcf_판정 = None
-    try:
-        fin = data.get("finance", {})
-        cfs = [v for v in (fin.get("영업CF") or []) if v and v > 0]
-        shrx = data.get("발행주식수_보통", 0) or 0
-        if cfs and shrx > 0 and ke > 0:
-            recent = cfs[-3:]; w = list(range(1, len(recent)+1))
-            avg_cf = sum(v*wt for v,wt in zip(recent,w)) / sum(w)
-            fcf = avg_cf * 0.7; g = min(ke * 0.3, 0.03)
-            if ke > g:
-                dcf_per_share = round(fcf / (ke - g) * 1e8 / shrx)
-                현재가 = data.get("현재가", 0) or 0
-                if 현재가 > 0 and dcf_per_share > 0:
-                    r = (현재가 / dcf_per_share - 1) * 100
-                    dcf_판정 = "저평가" if r < -20 else "고평가" if r > 20 else "적정"
-    except Exception:
-        pass
-
-    def _j(v, lo, hi, rev=False):
-        if v is None: return None
-        ok = v < lo if not rev else v > hi
-        ng = v > hi if not rev else v < lo
-        return "저평가" if ok else "고평가" if ng else "적정"
-
-    inv = data.get("투자자", {})
-
-    return {
-        "PER": per, "업종PER": data.get("업종_PER"), "PBR": pbr,
-        "배당": 배당수익률, "업종ROE": ind.get("업종_ROE"),
-        "업종배당": ind.get("업종_배당"), "EVEBITDA": ev,
-        "추정ROE": round(roe추정 * 100, 2), "시가총액": 시가총액,
-        "ROA": roa, "EPS": eps, "BPS": bps, "DPS": dps,
-        "배당성향": 배당성향, "배당여부": 배당여부, "배당3년연속": 배당3년연속,
-        "DCF": dcf_per_share,
-        "외국인순매수": inv.get("외국인_순매수"),
-        "기관순매수":   inv.get("기관_순매수"),
-        "개인순매수":   inv.get("개인_순매수"),
-        "외국인매수":   inv.get("외국인_매수"), "외국인매도": inv.get("외국인_매도"),
-        "기관매수":     inv.get("기관_매수"),   "기관매도":   inv.get("기관_매도"),
-        "개인매수":     inv.get("개인_매수"),   "개인매도":   inv.get("개인_매도"),
-        "PER판정": _j(per, 10, 25), "PBR판정": _j(pbr, 1.0, 3.0),
-        "EV판정":  _j(ev, 6, 15),  "DCF판정": dcf_판정,
-        "배당판정": _j(배당수익률, 2.0, 999, rev=True) if 배당수익률 else None,
-    }
 
 
 def _build_result(data: dict, xlsx_path: str, name: str, code: str) -> dict:
@@ -315,12 +263,18 @@ def _check_risk(ann: dict, 현재가: float, 발행주식수: int,
     자본총계_list = ann.get("자본총계", [])
     자본금_list   = ann.get("자본금", [])
 
-    def _last(lst): return (lst[-1] or 0) if lst else 0
+    def _last(lst):
+        if not lst: return None
+        for v in reversed(lst):
+            if v is not None: return v
+        return None
     매출액   = _last(매출액_list)
-    영업이익 = _last(영업이익_list)
-    자본총계 = _last(자본총계_list)
-    자본금   = _last(자본금_list)
+    영업이익 = _last(영업이익_list) or 0
+    자본총계 = _last(자본총계_list) or 0
+    자본금   = _last(자본금_list) or 0
     시가총액 = round((현재가 or 0) * (발행주식수 or 0) / 1e8)
+    매출액_없음 = 매출액 is None
+    매출액 = 매출액 or 0
 
     items = []
     is_kospi = (market == "KOSPI")
@@ -339,8 +293,12 @@ def _check_risk(ann: dict, 현재가: float, 발행주식수: int,
         else:               s, m = "safe",   f"해당없음  (자본총계 {자본총계:,.0f}억원)"
         items.append({"name":"자본잠식","status":s,"msg":m,"std":"자본금 50% 이상 잠식 시 관리종목"})
 
-        if   매출액 < 300:  s, m = "danger", f"{매출액:,.0f}억원  (기준 300억원 미만)"
-        else:               s, m = "safe",   f"{매출액:,.0f}억원  (기준 300억원 이상)"
+        if 매출액_없음:
+            s, m = "safe", "해당없음 (금융업종 매출 미집계)"
+        elif 매출액 < 300:
+            s, m = "danger", f"{매출액:,.0f}억원  (기준 300억원 미만)"
+        else:
+            s, m = "safe", f"{매출액:,.0f}억원  (기준 300억원 이상)"
         items.append({"name":"매출액","status":s,"msg":m,"std":"연간 매출 300억 미만 시 관리종목"})
 
         if   시가총액 < 500: s, m = "danger", f"{시가총액:,}억원  (기준 500억원 미만)"
@@ -466,6 +424,63 @@ def api_version():
     return jsonify({"version": "20260319-clean"})
 
 
+def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
+    def _last(lst):
+        return next((v for v in reversed(lst or []) if v is not None), None)
+    per=data.get("PER"); pbr=data.get("PBR"); ev=data.get("EV_EBITDA")
+    eps=_last(ann.get("EPS",[])); bps=_last(ann.get("BPS",[]))
+    roa=_last(ann.get("ROA",[])); dps=_last(ann.get("DPS",[]))
+    배당수익률=data.get("배당수익률")
+    배당성향=round(dps/eps*100,1) if dps and eps and eps>0 else None
+    dps_list=[v for v in (ann.get("DPS") or [])[-3:] if v is not None]
+    배당여부=bool(dps and dps>0)
+    배당3년연속=len(dps_list)>=3 and all(v>0 for v in dps_list)
+    dcf_per_share=dcf_판정=None
+    try:
+        fin=data.get("finance",{})
+        ann_oi=ann.get("영업이익",[])
+        # 영업CF 우선, 없으면 세전이익, 없으면 영업이익 순으로 대체
+        cfs=[v for v in (fin.get("영업CF") or []) if v and v>0]
+        if not cfs:
+            cfs=[v for v in (fin.get("세전계속사업이익") or []) if v and v>0]
+        if not cfs:
+            cfs=[v for v in (ann_oi or []) if v and v>0]
+        shrx=data.get("발행주식수_보통",0) or 0
+        if cfs and shrx>0 and ke>0:
+            recent=cfs[-3:]; w=list(range(1,len(recent)+1))
+            avg_cf=sum(v*wt for v,wt in zip(recent,w))/sum(w)
+            fcf=avg_cf*0.7; g=min(ke*0.3,0.03)
+            if ke>g:
+                dcf_per_share=round(fcf/(ke-g)*1e8/shrx)
+                현재가=data.get("현재가",0) or 0
+                if 현재가>0 and dcf_per_share>0:
+                    r=(현재가/dcf_per_share-1)*100
+                    dcf_판정="저평가" if r<-20 else "고평가" if r>20 else "적정"
+    except Exception:
+        pass
+    def _j(v,lo,hi,rev=False):
+        if v is None: return None
+        return "저평가" if (v<lo if not rev else v>hi) else "고평가" if (v>hi if not rev else v<lo) else "적정"
+    inv=data.get("투자자",{})
+    return {
+        "PER":per,"업종PER":data.get("업종_PER"),"PBR":pbr,
+        "배당":배당수익률,"업종ROE":ind.get("업종_ROE"),
+        "업종배당":ind.get("업종_배당"),"EVEBITDA":ev,
+        "추정ROE":round(roe추정*100,2),"시가총액":시가총액,
+        "ROA":roa,"EPS":eps,"BPS":bps,"DPS":dps,
+        "배당성향":배당성향,"배당여부":배당여부,"배당3년연속":배당3년연속,
+        "DCF":dcf_per_share,
+        "외국인순매수":inv.get("외국인_순매수"),"기관순매수":inv.get("기관_순매수"),
+        "개인순매수":inv.get("개인_순매수"),"외국인매수":inv.get("외국인_매수"),
+        "외국인매도":inv.get("외국인_매도"),"기관매수":inv.get("기관_매수"),
+        "기관매도":inv.get("기관_매도"),"개인매수":inv.get("개인_매수"),
+        "개인매도":inv.get("개인_매도"),
+        "PER판정":_j(per,10,25),"PBR판정":_j(pbr,1.0,3.0),
+        "EV판정":_j(ev,6,15),"DCF판정":dcf_판정,
+        "배당판정":_j(배당수익률,2.0,999,rev=True) if 배당수익률 else None,
+    }
+
+
 @app.route("/api/shutdown", methods=["POST"])
 def api_shutdown():
     return jsonify({"ok": True})
@@ -475,28 +490,43 @@ def api_shutdown():
 def api_stocklist():
     """자동완성용 종목 리스트"""
     try:
-        sys.path.insert(0, str(BASE))
-        import stock_search as _ss
-        importlib.reload(_ss)
-        # stock_search.py의 load_stock_list() 또는 검색 함수 활용
+        import json as _json
         cache = BASE / "WORK" / "stock_list.json"
         if cache.exists():
-            import json as _json
-            lst = _json.loads(cache.read_text(encoding="utf-8"))
-            # 형식 통일: [{"name":..,"code":..,"market":..}, ...]
+            raw = _json.loads(cache.read_text(encoding="utf-8"))
             result = []
-            for item in lst:
-                if isinstance(item, dict):
-                    result.append(item)
-                elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                    result.append({"name": item[0], "code": item[1],
-                                   "market": item[2] if len(item) > 2 else ""})
-            return jsonify({"list": result})
-        # 캐시 없으면 stock_search에서 직접 로딩
-        stocks = getattr(_ss, "load_stock_list", lambda: [])()
-        result = [{"name": s[0], "code": s[1], "market": s[2] if len(s) > 2 else ""}
-                  for s in stocks]
-        return jsonify({"list": result})
+
+            # 형식 1: {"cached_at":..., "data": {"종목명": ["코드","시장"], ...}}
+            if isinstance(raw, dict) and "data" in raw:
+                data = raw["data"]
+                for name, val in data.items():
+                    if isinstance(val, (list, tuple)) and len(val) >= 1:
+                        result.append({
+                            "name": name.strip(),
+                            "code": val[0],
+                            "market": val[1] if len(val) > 1 else ""
+                        })
+            # 형식 2: [{"name":..,"code":..,"market":..}, ...]
+            elif isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict):
+                        result.append({
+                            "name": item.get("name",""),
+                            "code": item.get("code",""),
+                            "market": item.get("market","")
+                        })
+                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                        result.append({
+                            "name": item[0], "code": item[1],
+                            "market": item[2] if len(item) > 2 else ""
+                        })
+            return jsonify({"list": result, "count": len(result)})
+        # 캐시 없으면 stock_search에서 로딩 시도
+        sys.path.insert(0, str(BASE))
+        import stock_search as _ss; importlib.reload(_ss)
+        items = _ss.load_stock_list() if hasattr(_ss, "load_stock_list") else []
+        result = [{"name":s[0],"code":s[1],"market":s[2] if len(s)>2 else ""} for s in items]
+        return jsonify({"list": result, "count": len(result)})
     except Exception as e:
         return jsonify({"list": [], "error": str(e)})
 
