@@ -133,22 +133,20 @@ def fill(template_path, json_path, out_path, strict_mode: bool = False):
     # ─────────────────────────────────────────────
     ws_결과 = wb["결과"]
 
-    # ROE 추정 방식
-    # - 일반 모드: 가중평균 고정 (분기 반영 자동 계산)
-    # - 엄선 모드: 컨센서스 우선 (1단계 스크리닝과 일관성)
-    if strict_mode:
-        # 컨센서스 ROE 존재 여부 확인
-        con_roe_list = con.get("ROE", [])
-        con_val = next((v for v in con_roe_list if v), None)
-        if con_val:
-            ws_결과["C20"] = "1순위"   # 컨센서스 1년차
-            print(f"  ROE 추정: 컨센서스 (엄선 모드)")
-        else:
-            ws_결과["C20"] = "가중평균"
-            print(f"  ROE 추정: 가중평균 (컨센서스 없음)")
+    # ROE 추정 방식 (최종 확정):
+    # 컨센서스 있음 → C20="1순위" (엑셀 V33이 컨센서스 1년차 자동 사용)
+    # 컨센서스 없음 → C20="가중평균" (엑셀 V33이 3년+분기 가중평균 자동 계산)
+    # strict_mode는 더 이상 C20에 영향 없음 (스크리닝과 웹 동일 기준)
+    con_roe_list = con.get("ROE", [])
+    con_val = next((v for v in con_roe_list if v), None)
+
+    if con_val:
+        ws_결과["C20"] = "1순위"
+        con_pct = con_val if con_val > 2 else con_val * 100
+        print(f"  ROE 추정: 컨센서스 1년차 {con_pct:.1f}% (1순위, 엑셀 자동 계산)")
     else:
         ws_결과["C20"] = "가중평균"
-        print(f"  ROE 추정: 가중평균 (분기 반영 시 자동 계산)")
+        print(f"  ROE 추정: 가중평균 3년+분기 (엑셀 자동 계산)")
 
     # ─────────────────────────────────────────────
     # 결과 시트: 할인율 (KIS BBB- 5년 수익률)

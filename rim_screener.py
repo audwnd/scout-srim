@@ -410,16 +410,38 @@ def fetch_detail_filter(code: str) -> dict:
 # ══════════════════════════════════════════════
 
 def estimate_roe(ann_roe: list, con_roe: list) -> float:
-    for v in (con_roe or []):
-        if v: return v/100 if v > 1 else v
+    """
+    ROE 추정 (최종 확정 방식):
+    - 컨센서스 없음: 연간 3년 가중평균 (1:2:3) / 6
+    - 컨센서스 있음: 연간 3년 + 컨센서스 1년차 (1:2:3:3) / 9
+    가중치 의미: 오래된 실적=1, 중간=2, 최근실적=3, 컨센서스=3
+    (최근 실적과 컨센서스를 동등하게 취급)
+    """
+    # 연간 ROE 정규화 (소수 단위)
     vals = []
     for v in (ann_roe or []):
         if v is not None:
-            vals.append(v/100 if v > 1 else v)
+            vals.append(v/100 if abs(v) > 2 else v)
     if not vals: return 0.0
-    recent = vals[-3:]
-    w = list(range(1, len(recent)+1))
-    return sum(v*wt for v,wt in zip(recent,w)) / sum(w)
+
+    recent3 = vals[-3:]
+    w3 = list(range(1, len(recent3)+1))  # 1,2,3
+
+    # 컨센서스 1년차
+    con1 = None
+    for v in (con_roe or []):
+        if v:
+            con1 = v/100 if abs(v) > 2 else v
+            break
+
+    if con1 is not None:
+        # 컨센서스 있음: 3년 + 컨센 (1:2:3:3)/9
+        vals4 = recent3 + [con1]
+        w4 = w3 + [3]
+        return sum(v*wt for v,wt in zip(vals4, w4)) / sum(w4)
+    else:
+        # 컨센서스 없음: 3년 (1:2:3)/6
+        return sum(v*wt for v,wt in zip(recent3, w3)) / sum(w3)
 
 
 def is_roe_improving(ann_roe: list) -> bool:

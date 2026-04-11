@@ -100,6 +100,18 @@ def _run_job(job_id: str, stock_name: str):
             if key in ann_data and isinstance(ann_data[key], list):
                 ann_data[key] = _fill_none_prev(ann_data[key])
 
+        # BPS 전부 None인 경우 → 지배주주지분으로 역산
+        bps_list = ann_data.get("BPS", [])
+        if all(v is None for v in bps_list) and bps_list:
+            cap_list = ann_data.get("지배주주지분", [])
+            shares = (data.get("발행주식수_보통", 0) or 0) - (data.get("자기주식", 0) or 0)
+            if shares > 0 and cap_list:
+                ann_data["BPS"] = [
+                    round(v * 1e8 / shares) if v is not None else None
+                    for v in cap_list
+                ]
+                ann_data["BPS"] = _fill_none_prev(ann_data["BPS"])
+
         work_dir = BASE / "WORK"
         work_dir.mkdir(exist_ok=True)
         json_path = work_dir / f"{code}_{found_name}.json"
@@ -117,6 +129,11 @@ def _run_job(job_id: str, stock_name: str):
         out_dir.mkdir(exist_ok=True)
         today    = datetime.now().strftime("%Y%m%d")
         out_path = out_dir / f"{found_name}_SRIM_{today}.xlsx"
+        # annual.years 빈 리스트 종목 → 엑셀 계산 스킵 (거래정지·데이터없음)
+        ann_years = data.get("annual", {}).get("years", [])
+        if not ann_years:
+            raise ValueError("실적 데이터 없음 (거래정지·상장예정·데이터 미수집 종목)")
+
         _filler.fill(str(template), str(json_path), str(out_path))
 
         # 4) win32com 재계산
@@ -179,17 +196,72 @@ def _build_result(data: dict, xlsx_path: str, name: str, code: str) -> dict:
     ind = data.get("industry", {})
 
     현재가   = data.get("현재가", 0) or 0
-    적정주가  = round(cv("C28")) if cv("C28") else 0
-    매도가격  = round(cv("C29")) if cv("C29") else 0
-    매수가격  = round(cv("C30")) if cv("C30") else 0
-    현재가대비 = (현재가 / 적정주가 - 1) * 100 if 적정주가 else 0
-    roe방식  = cv("C20") or "가중평균"
-    roe추정  = cv("D20") or 0
-    할인율   = cv("C17") or 0
-    추세    = cv("I21") or ""
-    배열    = cv("F31") or ""
-    roe수준  = cv("G31") or ""
-    h22    = cv("H22") or 0
+    # 현재가=0 → 상장폐지/거래정지 종목
+    if not 현재가:
+        raise ValueError("현재가 없음 (상장폐지·거래정지 종목으로 추정)")
+
+    # ── 금융/보험/지주 업종 판별 ──────────────────────────
+    # 매출액이 빈 리스트 = FnGuide 금융업 미집계 → 금융/보험/지주
+    _is_finance = not bool(ann.get("매출액", []))
+
+    def _last(lst):
+        return next((v for v in reversed(lst or []) if v is not None), None)
+
+    if _is_finance:
+        # B안: PBR-ROE 모델 (금융업계 표준)
+        # 적정PBR = ROE / ke  →  적정주가 = 적정PBR × BPS
+        # ROE가 높을수록 적정주가 높아짐 → "돈을 잘 버는 기업" 반영
+        # ke = BBB- 5년 할인율 (S-RIM과 동일 기준)
+        _con_roe = _last(con.get("ROE", []))
+        _ann_roe = _last(ann.get("ROE", []))
+        _con_bps = _last(con.get("BPS", []))
+        _ann_bps = _last(ann.get("BPS", []))
+
+        _roe = _con_roe or _ann_roe or 0   # 컨센서스 ROE 우선
+        _bps = _con_bps or _ann_bps or 0   # 컨센서스 BPS 우선
+        _ke  = cv("C17") or 0.1031         # 할인율 (엑셀 또는 기본값)
+
+        # BPS 없으면 지배주주지분으로 역산
+        if not _bps:
+            _cap = _last(ann.get("지배주주지분", []))
+            _sh  = (data.get("발행주식수_보통", 0) or 0) - (data.get("자기주식", 0) or 0)
+            if _cap and _sh > 0:
+                _bps = round(_cap * 1e8 / _sh)
+
+        if _roe > 0 and _bps > 0 and _ke > 0:
+            # ROE가 1 이상이면 % 단위로 저장된 것 → 소수로 변환
+            _roe_dec = _roe / 100 if _roe > 1 else _roe
+            적정pbr  = min(_roe_dec / _ke, 3.0)  # 상한 3배 제한
+            적정주가 = round(적정pbr * _bps)
+            roe방식  = "PBR-ROE모델"
+            print(f"  [금융/보험] ROE({_roe_dec*100:.1f}%)÷ke({_ke*100:.1f}%)={적정pbr:.2f}배 × BPS({_bps:,}) → {적정주가:,}원")
+        else:
+            적정주가 = 0
+            roe방식  = "금융업(계산불가)"
+            print(f"  [금융/보험] 데이터 부족 (ROE={_roe}, BPS={_bps})")
+
+        적정주가  = max(0, 적정주가)
+        매수가격  = round(적정주가 * 0.8)
+        매도가격  = round(적정주가 * 1.2)
+    else:
+        # 일반기업: 기존 S-RIM
+        적정주가  = round(cv("C28")) if cv("C28") else 0
+        매도가격  = round(cv("C29")) if cv("C29") else 0
+        매수가격  = round(cv("C30")) if cv("C30") else 0
+        # 적정주가 음수 방지
+        if 적정주가 < 0:
+            적정주가 = 0
+        roe방식  = cv("C20") or "가중평균"
+
+    # ─────────────────────────────────────────────────────
+    현재가대비 = round((현재가 / 적정주가 - 1) * 100, 1) if 적정주가 else 0
+    roe방식  = roe방식 if _is_finance else (cv("C20") or "가중평균")
+    roe추정  = round(_last(ann.get("ROE", [])) * 100, 2) if _is_finance else (cv("D20") or 0)
+    할인율   = cv("C17") or 0.1031
+    추세    = "" if _is_finance else (cv("I21") or "")
+    배열    = "" if _is_finance else (cv("F31") or "")
+    roe수준  = "" if _is_finance else (cv("G31") or "")
+    h22    = 0 if _is_finance else (cv("H22") or 0)
 
     # 추세/배열/ROE수준 폴백
     if not 추세:
@@ -234,7 +306,7 @@ def _build_result(data: dict, xlsx_path: str, name: str, code: str) -> dict:
         "매도가격":  매도가격,
         "현재가대비": round(현재가대비, 1),
         "roe방식":   roe방식,
-        "roe추정":   round(roe추정 * 100, 2),
+        "roe추정":   roe추정 if _is_finance else round((roe추정 or 0) * 100, 2),
         "할인율":    round(할인율 * 100, 2),
         "추세":      str(추세),
         "배열":      str(배열),
@@ -375,6 +447,23 @@ def _check_risk(ann: dict, 현재가: float, 발행주식수: int,
         items.append({"name":"단기차입금/이익잉여금","status":s,"msg":m,
                       "std":"단기차입금 > 이익잉여금 시 유동성 위험"})
 
+    # ── 고PBR 경고 (금융주 제외) ──────────────────────────
+    if not 매출액_없음:
+        bps_list = ann.get("BPS", [])
+        bps_last = next((v for v in reversed(bps_list) if v), None)
+        if bps_last and bps_last > 0 and 현재가 and 현재가 > 0:
+            pbr = 현재가 / bps_last
+            if pbr >= 15:
+                s, m = "danger", f"PBR {pbr:.1f}배 — S-RIM 신뢰도 낮음 (순자산 대비 현재가 과도)"
+            elif pbr >= 10:
+                s, m = "warn",   f"PBR {pbr:.1f}배 — S-RIM 적정주가와 시장가 괴리 클 수 있음"
+            else:
+                s = None
+            if s:
+                items.append({"name": "고PBR",
+                              "status": s, "msg": m,
+                              "std": "PBR 10배 이상: 미래 성장 기대 반영 주가 — 재무제표 기반 평가 한계"})
+
     return items
 
 
@@ -429,11 +518,16 @@ def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
         return next((v for v in reversed(lst or []) if v is not None), None)
     per=data.get("PER"); pbr=data.get("PBR"); ev=data.get("EV_EBITDA")
     eps=_last(ann.get("EPS",[])); bps=_last(ann.get("BPS",[]))
-    roa=_last(ann.get("ROA",[])); dps=_last(ann.get("DPS",[]))
+    roa=_last(ann.get("ROA",[]))
+    # DPS: 마지막 연도 값 직접 참조 (None이면 해당연도 무배당)
+    dps_list_raw = ann.get("DPS", [])
+    dps = dps_list_raw[-1] if dps_list_raw else None  # 최근연도 값 (None=무배당)
+    dps_last_valid = _last(dps_list_raw)              # 가장 최근 유효값 (배당성향 계산용)
     배당수익률=data.get("배당수익률")
-    배당성향=round(dps/eps*100,1) if dps and eps and eps>0 else None
+    배당성향=round(dps_last_valid/eps*100,1) if dps_last_valid and eps and eps>0 else None
     dps_list=[v for v in (ann.get("DPS") or [])[-3:] if v is not None]
-    배당여부=bool(dps and dps>0)
+    배당여부=bool(dps and dps>0)           # 최근연도 배당 여부
+    배당중단=bool(not dps and dps_last_valid)  # 과거엔 했는데 최근 중단
     배당3년연속=len(dps_list)>=3 and all(v>0 for v in dps_list)
     dcf_per_share=dcf_판정=None
     try:
@@ -462,13 +556,94 @@ def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
         if v is None: return None
         return "저평가" if (v<lo if not rev else v>hi) else "고평가" if (v>hi if not rev else v<lo) else "적정"
     inv=data.get("투자자",{})
+
+    # ── 영업이익률 추세 ──────────────────────────────────────
+    op_margin_msg = None
+    try:
+        op_list = ann.get("영업이익", [])
+        rev_list = ann.get("매출액", [])
+        if op_list and rev_list and any(v for v in rev_list if v):
+            margins = [round(o/r*100,1) if o and r and r>0 else None
+                       for o,r in zip(op_list, rev_list)]
+            valid = [m for m in margins[-3:] if m is not None]
+            if len(valid) >= 2:
+                diff = round(valid[-1] - valid[0], 1)
+                trend = "개선" if diff > 0 else "악화"
+                op_margin_msg = f"영업이익률 {trend} ({valid[0]}%→{valid[-1]}%)"
+    except Exception:
+        pass
+
+    # ── EPS 증감 (YoY) ──────────────────────────────────────
+    eps_yoy_msg = None
+    try:
+        eps_vals = [v for v in (ann.get("EPS") or []) if v is not None]
+        if len(eps_vals) >= 2:
+            e_prev, e_last = eps_vals[-2], eps_vals[-1]
+            if e_prev and e_prev > 0:
+                yoy = round((e_last/e_prev-1)*100, 1)
+                sign = "+" if yoy >= 0 else ""
+                eps_yoy_msg = f"주당순이익(EPS) 전년 대비 {sign}{yoy}%"
+            elif e_prev and e_prev < 0 and e_last > 0:
+                eps_yoy_msg = "전년 적자 → 흑자 전환"
+            elif e_prev and e_prev < 0:
+                eps_yoy_msg = "전년도 적자 → 비교 불가"
+    except Exception:
+        pass
+
+    # ── 컨센서스 EPS 성장률 ──────────────────────────────────
+    con_eps_msg = None
+    try:
+        con_eps_list = data.get("consensus", {}).get("EPS", [])
+        con_eps_1 = next((v for v in con_eps_list if v), None)
+        eps_vals2 = [v for v in (ann.get("EPS") or []) if v is not None]
+        e_last2 = eps_vals2[-1] if eps_vals2 else None
+        if con_eps_1 and e_last2:
+            if e_last2 > 0:
+                con_yoy = round((con_eps_1/e_last2-1)*100, 1)
+                sign = "+" if con_yoy >= 0 else ""
+                con_eps_msg = f"내년 실적 전망 {sign}{con_yoy}% (애널리스트 예측)"
+            elif e_last2 < 0 and con_eps_1 > 0:
+                con_eps_msg = "내년 흑자 전환 기대 (애널리스트 예측)"
+            elif e_last2 < 0 and con_eps_1 < 0:
+                con_eps_msg = "내년에도 적자 지속 전망 (애널리스트 예측)"
+    except Exception:
+        pass
+    bps_cagr = None
+    try:
+        bps_vals = [v for v in (ann.get("BPS") or []) if v and v > 0]
+        if len(bps_vals) >= 2:
+            n = min(len(bps_vals) - 1, 5)
+            bps_cagr = round((bps_vals[-1] / bps_vals[-1-n]) ** (1/n) * 100 - 100, 1)
+    except Exception:
+        pass
+
+    # ── 부채비율 ────────────────────────────────────────────
+    부채비율 = None
+    try:
+         부채 = next((v for v in reversed(ann.get("부채총계") or []) if v), None)
+         자본 = next((v for v in reversed(ann.get("자본총계") or []) if v), None)
+         if 부채 and 자본 and 자본 > 0:
+             부채비율 = round(부채 / 자본 * 100, 1)
+    except Exception:
+        pass
+
+    # ── 베타 ────────────────────────────────────────────────
+    베타 = data.get("베타")
+
     return {
         "PER":per,"업종PER":data.get("업종_PER"),"PBR":pbr,
         "배당":배당수익률,"업종ROE":ind.get("업종_ROE"),
+        "KOSPI_ROE":ind.get("KOSPI_ROE"),
         "업종배당":ind.get("업종_배당"),"EVEBITDA":ev,
-        "추정ROE":round(roe추정*100,2),"시가총액":시가총액,
+        "추정ROE":round(roe추정 if roe추정 > 1 else roe추정*100, 2),"시가총액":시가총액,
         "ROA":roa,"EPS":eps,"BPS":bps,"DPS":dps,
-        "배당성향":배당성향,"배당여부":배당여부,"배당3년연속":배당3년연속,
+        "BPS성장률":bps_cagr,
+        "베타":round(베타,2) if 베타 else None,
+        "부채비율":부채비율,
+        "op_margin_msg":op_margin_msg,
+        "eps_yoy_msg":eps_yoy_msg,
+        "con_eps_msg":con_eps_msg,
+        "배당성향":배당성향,"배당여부":배당여부,"배당중단":배당중단,"배당3년연속":배당3년연속,
         "DCF":dcf_per_share,
         "외국인순매수":inv.get("외국인_순매수"),"기관순매수":inv.get("기관_순매수"),
         "개인순매수":inv.get("개인_순매수"),"외국인매수":inv.get("외국인_매수"),
