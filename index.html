@@ -1051,7 +1051,7 @@ function modalSearch() {
   $('modalSaveBtn').disabled = true;
   $('modalResult').style.display = '';
   $('modalStockInfo').innerHTML = '<span style="color:var(--muted)">📡 S-RIM 계산 중...</span>';
-  $('modalBuyPrice').textContent = $('modalAptPrice').textContent = $('modalSellTarget').textContent = '-';
+  $('modalScoutBuy').textContent = $('modalAptPrice').textContent = $('modalSellTarget').textContent = '-';
   fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})
     .then(r=>r.json()).then(d=>{
       if(d.error){$('modalStockInfo').textContent='오류: '+d.error;return;}
