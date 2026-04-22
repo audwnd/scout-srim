@@ -333,6 +333,12 @@ body{background:var(--bg);color:var(--text);font-family:'Pretendard','Apple SD G
     <div class="card-title">매도 완료</div>
     <div id="pfSoldTable"></div>
   </div>
+
+  <!-- SCOUT 성과 분석 (데이터 3건 이상 시 표시) -->
+  <div class="card" id="pfAnalysisCard" style="display:none;margin-top:12px">
+    <div class="card-title">SCOUT 방법론 검증</div>
+    <div id="pfAnalysis"></div>
+  </div>
 </div>
 
 <!-- ── 종목 추가 모달 ── -->
@@ -797,6 +803,7 @@ function renderPortfolio() {
   renderPfSummary(holdings, sold);
   renderPfTable(holdings);
   renderSoldTable(sold);
+  renderPfAnalysis(holdings, sold);
 }
 
 function renderPfSummary(holdings, sold) {
@@ -805,17 +812,37 @@ function renderPfSummary(holdings, sold) {
     el.innerHTML = '<div class="pf-empty" style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:32px;margin-bottom:0">추적 중인 종목이 없습니다.<br><span style="font-size:12px;color:var(--muted)">우측의 <b>+ 종목 추가</b> 버튼으로 SCOUT 스크리닝 결과 종목을 등록해보세요.</span></div>';
     return;
   }
-  const wp = holdings.filter(h => h.current_price && h.buy_price);
-  const avgRet = wp.length ? wp.reduce((s,h)=>s+(h.current_price-h.buy_price)/h.buy_price*100,0)/wp.length : null;
-  const ws = sold.filter(h => h.sell_actual_price && h.buy_price);
+  const wp      = holdings.filter(h => h.current_price && h.buy_price);
+  const avgRet  = wp.length ? wp.reduce((s,h)=>s+(h.current_price-h.buy_price)/h.buy_price*100,0)/wp.length : null;
+  const winCnt  = wp.filter(h => h.current_price > h.buy_price).length;
+  const winRate = wp.length ? Math.round(winCnt/wp.length*100) : null;
+  const aptHit  = wp.filter(h => h.apt_price && h.current_price >= h.apt_price).length; // 적정가 도달
+  const ws      = sold.filter(h => h.sell_actual_price && h.buy_price);
   const avgSold = ws.length ? ws.reduce((s,h)=>s+(h.sell_actual_price-h.buy_price)/h.buy_price*100,0)/ws.length : null;
+  const soldWin = ws.filter(h => h.sell_actual_price > h.buy_price).length;
   const rc = v => v==null?'var(--muted)':v>=0?'var(--red)':'var(--blue)';
   const rv = v => v==null?'-':(v>=0?'+':'')+v.toFixed(2)+'%';
-  el.innerHTML = `<div class="pf-summary-grid">
-    <div class="pf-sum-item"><div class="pf-sum-label">보유 종목</div><div class="pf-sum-val">${holdings.length}종목</div></div>
-    <div class="pf-sum-item"><div class="pf-sum-label">평균 수익률</div><div class="pf-sum-val" style="color:${rc(avgRet)}">${rv(avgRet)}</div></div>
-    <div class="pf-sum-item"><div class="pf-sum-label">매도 완료</div><div class="pf-sum-val">${sold.length}건</div></div>
-    <div class="pf-sum-item"><div class="pf-sum-label">확정 수익률</div><div class="pf-sum-val" style="color:${rc(avgSold)}">${rv(avgSold)}</div></div>
+  el.innerHTML = `<div class="pf-summary-grid" style="grid-template-columns:repeat(4,1fr)">
+    <div class="pf-sum-item">
+      <div class="pf-sum-label">보유 종목</div>
+      <div class="pf-sum-val">${holdings.length}종목</div>
+      ${winRate!=null?`<div style="font-size:11px;color:var(--muted);margin-top:4px">승률 <b style="color:${winRate>=50?'var(--green)':'var(--amber)'}">${winRate}%</b></div>`:''}
+    </div>
+    <div class="pf-sum-item">
+      <div class="pf-sum-label">평균 수익률</div>
+      <div class="pf-sum-val" style="color:${rc(avgRet)}">${rv(avgRet)}</div>
+      ${aptHit?`<div style="font-size:11px;color:var(--green);margin-top:4px">적정가 도달 ${aptHit}종목</div>`:''}
+    </div>
+    <div class="pf-sum-item">
+      <div class="pf-sum-label">매도 완료</div>
+      <div class="pf-sum-val">${sold.length}건</div>
+      ${ws.length?`<div style="font-size:11px;color:var(--muted);margin-top:4px">수익 ${soldWin}건 / 손실 ${ws.length-soldWin}건</div>`:''}
+    </div>
+    <div class="pf-sum-item">
+      <div class="pf-sum-label">확정 수익률</div>
+      <div class="pf-sum-val" style="color:${rc(avgSold)}">${rv(avgSold)}</div>
+      ${ws.length?`<div style="font-size:11px;color:var(--muted);margin-top:4px">SCOUT 검증 ${ws.length}건 누적</div>`:''}
+    </div>
   </div>`;
 }
 
@@ -826,19 +853,31 @@ function renderPfTable(holdings) {
     return;
   }
   const rows = holdings.map(h => {
-    const cur  = h.current_price || 0;
-    const ret  = cur && h.buy_price ? (cur - h.buy_price) / h.buy_price * 100 : null;
-    const rc   = ret==null?'':ret>=0?'color:var(--red)':'color:var(--blue)';
-    const prog = cur && h.buy_price && h.apt_price && h.apt_price>h.buy_price
-                 ? Math.min((cur-h.buy_price)/(h.apt_price-h.buy_price)*100, 999) : null;
-    const pc   = prog==null?'':prog>=100?'color:var(--green)':prog>=50?'color:var(--amber)':'';
-    return `<tr>
-      <td><div class="pf-name">${h.name}</div><div style="font-size:10px;color:var(--muted)">${h.code}${h.배열?'&ensp;<span style="font-size:10px;color:var(--muted)">'+h.배열+'</span>':''}</div></td>
+    const cur   = h.current_price || 0;
+    const ret   = cur && h.buy_price ? (cur - h.buy_price) / h.buy_price * 100 : null;
+    const rc    = ret==null?'':ret>=0?'color:var(--red)':'color:var(--blue)';
+    const prog  = cur && h.buy_price && h.apt_price && h.apt_price > h.buy_price
+                  ? Math.min((cur - h.buy_price) / (h.apt_price - h.buy_price) * 100, 999) : null;
+    const pc    = prog==null?'':prog>=100?'color:var(--green)':prog>=50?'color:var(--amber)':'';
+    // 적정가 도달 여부
+    const aptReached  = cur && h.apt_price  && cur >= h.apt_price;
+    // 매도가 도달 여부
+    const sellReached = cur && h.sell_target && cur >= h.sell_target;
+    const rowBg = sellReached ? 'background:rgba(62,207,142,.06)' : aptReached ? 'background:rgba(79,158,255,.05)' : '';
+    return `<tr style="${rowBg}">
+      <td>
+        <div class="pf-name">${h.name}
+          ${sellReached ? '&ensp;<span style="font-size:10px;color:var(--green);font-weight:700">매도가 도달↑</span>' :
+            aptReached  ? '&ensp;<span style="font-size:10px;color:var(--blue);font-weight:700">적정가 도달</span>' : ''}
+        </div>
+        <div style="font-size:10px;color:var(--muted)">${h.code}${h.배열?'&ensp;'+h.배열:''}</div>
+      </td>
       <td style="font-size:12px;color:var(--muted);white-space:nowrap">${h.buy_date}</td>
-      <td class="pf-num">${fmt(h.buy_price)}원${h.scout_buy?'<div style="font-size:10px;color:var(--muted)">목표 '+fmt(h.scout_buy)+'</div>':''}</td>
-      <td class="pf-num">${cur?fmt(cur)+'원':'-'}</td>
+      <td class="pf-num">${fmt(h.buy_price)}원</td>
+      <td class="pf-num">${cur ? fmt(cur)+'원' : '-'}</td>
       <td class="pf-num" style="${rc}">${ret!=null?(ret>=0?'+':'')+ret.toFixed(2)+'%':'-'}</td>
-      <td class="pf-num" style="color:var(--blue)">${fmt(h.apt_price)}원</td>
+      <td class="pf-num" style="${aptReached?'color:var(--blue);font-weight:700':'color:var(--muted)'}">${h.apt_price ? fmt(h.apt_price)+'원' : '-'}</td>
+      <td class="pf-num" style="${sellReached?'color:var(--green);font-weight:700':'color:var(--muted)'}">${h.sell_target ? fmt(h.sell_target)+'원' : '-'}</td>
       <td class="pf-num" style="${pc}">${prog!=null?prog.toFixed(0)+'%':'-'}</td>
       <td class="pf-num">${h.quantity}주</td>
       <td><div style="display:flex;gap:4px;justify-content:flex-end">
@@ -854,6 +893,7 @@ function renderPfTable(holdings) {
       <th class="pf-num">현재가</th>
       <th class="pf-num">수익률</th>
       <th class="pf-num">SCOUT 적정가</th>
+      <th class="pf-num">SCOUT 매도가</th>
       <th class="pf-num">목표도달</th>
       <th class="pf-num">수량</th>
       <th></th>
@@ -888,6 +928,83 @@ function renderSoldTable(sold) {
     </tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
+}
+
+// ── SCOUT 방법론 검증 분석 ──────────────────────────────
+function renderPfAnalysis(holdings, sold) {
+  const card = $('pfAnalysisCard');
+  const all  = [...holdings, ...sold];
+  if (all.length < 2) { card.style.display='none'; return; }
+  card.style.display='';
+
+  // 배열별 분석
+  const byBaeyeol = {};
+  all.forEach(h => {
+    const b  = h.배열 || '미분류';
+    const cp = h.status==='sold' ? h.sell_actual_price : h.current_price;
+    if (!cp || !h.buy_price) return;
+    if (!byBaeyeol[b]) byBaeyeol[b] = { cnt:0, win:0, retSum:0 };
+    const ret = (cp - h.buy_price) / h.buy_price * 100;
+    byBaeyeol[b].cnt++;
+    byBaeyeol[b].retSum += ret;
+    if (ret > 0) byBaeyeol[b].win++;
+  });
+
+  // 적정가 도달률 (보유+매도 전체)
+  const withApt = all.filter(h => h.apt_price && h.buy_price);
+  const aptReached = withApt.filter(h => {
+    const cp = h.status==='sold' ? (h.sell_actual_price||0) : (h.current_price||0);
+    return cp >= h.apt_price;
+  }).length;
+
+  // 매도가 도달률
+  const withSell = all.filter(h => h.sell_target && h.buy_price);
+  const sellReached = withSell.filter(h => {
+    const cp = h.status==='sold' ? (h.sell_actual_price||0) : (h.current_price||0);
+    return cp >= h.sell_target;
+  }).length;
+
+  // 배열별 요약 HTML
+  const baeyeolRows = Object.entries(byBaeyeol).map(([b, v]) => {
+    const avg = v.cnt ? v.retSum/v.cnt : 0;
+    const wr  = v.cnt ? Math.round(v.win/v.cnt*100) : 0;
+    const rc  = avg>=0?'var(--red)':'var(--blue)';
+    const wc  = wr>=50?'var(--green)':'var(--amber)';
+    return `<div class="pf-sum-item">
+      <div class="pf-sum-label">${b}</div>
+      <div style="font-size:14px;font-weight:700;color:${rc}">${avg>=0?'+':''}${avg.toFixed(1)}%</div>
+      <div style="font-size:11px;color:${wc};margin-top:3px">승률 ${wr}% (${v.cnt}종목)</div>
+    </div>`;
+  }).join('');
+
+  $('pfAnalysis').innerHTML = `
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+      총 ${all.length}종목 누적 데이터 기준 &ensp;·&ensp; 데이터가 쌓일수록 신뢰도 높아집니다
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px">
+      <div class="pf-sum-item">
+        <div class="pf-sum-label">SCOUT 적정가 도달률</div>
+        <div class="pf-sum-val" style="color:var(--blue)">${withApt.length?Math.round(aptReached/withApt.length*100):0}%</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px">${aptReached} / ${withApt.length}종목</div>
+      </div>
+      <div class="pf-sum-item">
+        <div class="pf-sum-label">SCOUT 매도가 도달률</div>
+        <div class="pf-sum-val" style="color:var(--green)">${withSell.length?Math.round(sellReached/withSell.length*100):0}%</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px">${sellReached} / ${withSell.length}종목</div>
+      </div>
+      <div class="pf-sum-item">
+        <div class="pf-sum-label">전체 승률</div>
+        <div class="pf-sum-val" style="color:${all.filter(h=>(h.status==='sold'?h.sell_actual_price:h.current_price)>h.buy_price).length/all.length>=0.5?'var(--green)':'var(--amber)'}">
+          ${Math.round(all.filter(h=>{const cp=h.status==='sold'?h.sell_actual_price:h.current_price;return cp&&h.buy_price&&cp>h.buy_price;}).length/all.length*100)}%
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px">전체 ${all.length}종목 기준</div>
+      </div>
+    </div>
+    ${Object.keys(byBaeyeol).length>1?`
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">배열별 평균 수익률</div>
+    <div style="display:grid;grid-template-columns:repeat(${Object.keys(byBaeyeol).length},1fr);gap:8px">${baeyeolRows}</div>
+    `:''}
+  `;
 }
 
 // ── 종목 추가 모달 ────────────────────────────────────
