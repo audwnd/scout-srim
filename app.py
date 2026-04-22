@@ -62,7 +62,18 @@ def _run_job(job_id: str, stock_name: str):
         # 2) FnGuide 수집
         import fnguide_collector_v4 as _col
         importlib.reload(_col)
-        data = _col.collect(found_name, code)
+        try:
+            data = _col.collect(found_name, code)
+        except Exception as e:
+            err_msg = str(e)
+            # 타임아웃 / 연결오류 → 사용자 친화적 메시지
+            if "Timeout" in type(e).__name__ or "timed out" in err_msg or "재시도 실패" in err_msg:
+                err_msg = f"FnGuide 서버 응답 시간 초과 (3회 재시도 실패)\n잠시 후 다시 검색해 주세요."
+            elif "ConnectionError" in type(e).__name__ or "Connection" in err_msg:
+                err_msg = f"FnGuide 서버 연결 실패\n인터넷 연결을 확인하거나 잠시 후 다시 시도해 주세요."
+            with _lock:
+                _status[job_id] = {"state": "error", "msg": err_msg}
+            return
 
         # 시장 정보
         try:
@@ -118,48 +129,38 @@ def _run_job(job_id: str, stock_name: str):
         with open(str(json_path), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-        with _lock:
-            _status[job_id]["msg"] = "S-RIM 계산 중..."
-
-        # 3) 엑셀 계산
-        import srim_filler_v4 as _filler
-        importlib.reload(_filler)
-        template = BASE / "S-RIM_V33_ForwardBlock.xlsx"
-        out_dir  = BASE / "OUTPUT"
-        out_dir.mkdir(exist_ok=True)
-        today    = datetime.now().strftime("%Y%m%d")
-        out_path = out_dir / f"{found_name}_SRIM_{today}.xlsx"
-        # annual.years 빈 리스트 종목 → 엑셀 계산 스킵 (거래정지·데이터없음)
+        # annual.years 빈 리스트 종목 → 계산 불가 (거래정지·데이터없음)
         ann_years = data.get("annual", {}).get("years", [])
         if not ann_years:
             raise ValueError("실적 데이터 없음 (거래정지·상장예정·데이터 미수집 종목)")
 
-        _filler.fill(str(template), str(json_path), str(out_path))
+        with _lock:
+            _status[job_id]["msg"] = "S-RIM 계산 중..."
 
-        # 4) win32com 재계산
+        # 3) ke 계산 + S-RIM Python 직접 계산 (PRIMARY — Excel 불필요)
+        ke = _compute_ke(data)
+        apt, sell, buy, meta = _srim_python(data, ke)
+
+        # 4) 결과 빌드 (Excel 의존 없음)
+        result = _build_result(data, found_name, code, ke, apt, sell, buy, meta)
+
+        # 5) Excel 생성 (best-effort, 다운로드용 — 계산에 사용 안 함)
         try:
-            import pythoncom, time
-            pythoncom.CoInitialize()
-            import win32com.client as win32
-            xl  = win32.Dispatch("Excel.Application")
-            xl.Visible      = False
-            xl.DisplayAlerts= False
-            wb  = xl.Workbooks.Open(str(out_path.resolve()))
-            wb.Application.CalculateFull()
-            wb.Save()
-            wb.Close(False)
-            xl.Quit()
-            del wb, xl
-            time.sleep(0.3)
-            pythoncom.CoUninitialize()
-            print("  ✓ win32com 재계산 완료")
+            with _lock:
+                _status[job_id]["msg"] = "Excel 파일 생성 중..."
+            import srim_filler_v4 as _filler
+            importlib.reload(_filler)
+            template = BASE / "S-RIM_V33_ForwardBlock.xlsx"
+            out_dir  = BASE / "OUTPUT"
+            out_dir.mkdir(exist_ok=True)
+            today    = datetime.now().strftime("%Y%m%d")
+            out_path = out_dir / f"{found_name}_SRIM_{today}.xlsx"
+            _filler.fill(str(template), str(json_path), str(out_path))
+            result["xlsx"] = str(out_path)
+            print("  ✓ Excel 생성 완료 (다운로드용)")
         except Exception as e:
-            print(f"  [win32com 오류] {e}")
-            try: pythoncom.CoUninitialize()
-            except: pass
-
-        # 5) 결과 읽기
-        result = _build_result(data, str(out_path), found_name, code)
+            print(f"  [Excel 생성 실패, 무시] {e}")
+            result["xlsx"] = ""
 
         with _lock:
             _status[job_id] = {"state": "done", "result": result}
@@ -171,97 +172,309 @@ def _run_job(job_id: str, stock_name: str):
             _status[job_id] = {"state": "error", "msg": str(e), "trace": tb}
 
 
-def _build_result(data: dict, xlsx_path: str, name: str, code: str) -> dict:
-    import openpyxl
-
-    xlsx_vals = {}
+def _compute_ke(data: dict) -> float:
+    """
+    요구수익률(ke) = KIS BBB- 5년 수익률 (직접입력 모드)
+    Excel 결과!D14 (C14="적용" 상태) 와 동일 방식:
+      ke = BBB- 5년 수익률  (beta 적용 없음, 직접 사용)
+    KIS 수집 실패 시 기본값 0.1031 (10.31%) 사용
+    """
     try:
-        wb   = openpyxl.load_workbook(xlsx_path, data_only=True)
-        ws결  = wb["결과"]
-        for cell in ["C28","C29","C30","C20","D20","C17","H22","I21","F31","G31"]:
-            xlsx_vals[cell] = ws결[cell].value
-        wb.close()
+        sys.path.insert(0, str(BASE))
+        import kis_collector as _kis
+        importlib.reload(_kis)
+        ke = _kis.get_bbb_minus_5yr()
     except Exception as e:
-        print(f"  [엑셀 읽기 오류] {e}")
+        print(f"  [BBB- 수집 실패, 기본값 사용] {e}")
+        ke = 0.1031  # 기본값: 10.31%
+    ke = round(max(0.05, min(ke, 0.25)), 4)
+    print(f"  [ke 계산] BBB- 5년 수익률 = {ke*100:.2f}%")
+    return ke
 
-    def cv(coord, default=None):
-        v = xlsx_vals.get(coord)
-        if v is None or v == "":
-            return default
-        return v
 
+def _srim_python(data: dict, ke: float, 배열: str = "") -> tuple:
+    """
+    S-RIM 적정주가 Python 직접 계산 (Excel 수식 완전 재현 버전)
+
+    Excel과의 차이점 수정:
+      1. ROE:      실적3년+분기+컨센(1:2:3:3:3) / 컨센없으면(1:2:3:3) 가중평균
+      2. equity_0: 컨센서스 1년차 지배주주지분 우선 (없으면 연간 최신)
+      3. shares:   보통주 + 우선주 - 자기주식 (우선주 포함)
+      4. fade^t:   초과이익 감쇄 지수 t 시작 (기존 t-1 → t)
+      5. 기준시점-현재 할인: 최근결산 연말 → 오늘 경과일 반영
+      6. 정배열/역배열 매핑: C28/C29/C30 엑셀 동일 배정
+
+    반환: (적정주가, 매도가격, 매수가격) int (원)
+    """
+    from datetime import date as _date
+
+    ann = data.get("annual", {})
+    con = data.get("consensus", {})
+    qtr = data.get("quarter", {})
+
+    def _last(lst):
+        return next((v for v in reversed(lst or []) if v is not None), None)
+
+    def _first(lst):
+        return next((v for v in (lst or []) if v is not None), None)
+
+    def _norm(v):
+        """ROE 값을 소수 단위로 정규화"""
+        if v is None: return None
+        return v/100 if abs(v) > 2 else v
+
+    # ── 1. 분기 trailing 4Q ROE 계산 ─────────────────────────────────────
+    def _trailing_4q_roe() -> float | None:
+        """최근4분기 누적 ROE. Q4결산이면 연간ROE 그대로, 아니면 추정."""
+        q_years = qtr.get("years", [])
+        q_ni    = qtr.get("지배주주순이익", [])
+        q_eq    = qtr.get("지배주주지분", [])
+
+        # 실적 분기만 (E 제외)
+        actuals = [(ni, eq, yr) for ni, eq, yr in zip(q_ni, q_eq, q_years)
+                   if ni is not None and "(E)" not in str(yr)]
+
+        def _last_ann():
+            return _norm(_last(ann.get("ROE", [])))
+
+        if not actuals:
+            return _last_ann()
+
+        last_yr_str = str(actuals[-1][2])
+        # Q4(12월) 결산이면 연간 ROE가 trailing 4Q와 동일
+        if last_yr_str.endswith("/12"):
+            return _last_ann()
+
+        # Q1~Q3: trailing NI 합산 추정
+        actual_ni = [ni for ni, eq, yr in actuals]
+        n = len(actual_ni)
+        ann_ni_list = [v for v in (ann.get("지배주주순이익", []) or []) if v is not None]
+        if ann_ni_list and n < 4:
+            # 부족 분기 = 직전 연간 NI / 4 × 부족수
+            trailing_ni = sum(actual_ni) + (ann_ni_list[-1] / 4) * (4 - n)
+        elif n >= 4:
+            trailing_ni = sum(actual_ni[-4:])
+        else:
+            return _last_ann()
+
+        eq_end = actuals[-1][1]
+        ann_eq = [v for v in (ann.get("지배주주지분", []) or []) if v is not None]
+        eq_begin = ann_eq[-2] if len(ann_eq) >= 2 else eq_end
+        if not eq_end or eq_end <= 0:
+            return _last_ann()
+        return trailing_ni / ((eq_begin + eq_end) / 2)
+
+    # ── 2. ROE 가중평균: 실적3년 + 분기 + 컨센(가장가까운1개년) ──────────
+    # 컨센서스 있음: (1:2:3:3:3) / 12
+    # 컨센서스 없음: (1:2:3:3)   /  9
+    ann_roe_raw = ann.get("ROE", [])
+    con_roe_raw = con.get("ROE", [])
+
+    ann_vals = [_norm(v) for v in (ann_roe_raw or []) if v is not None]
+    if not ann_vals:
+        return 0, 0, 0, {}
+
+    recent3 = ann_vals[-3:]
+    w3 = list(range(1, len(recent3) + 1))  # 1, 2, 3
+
+    q_roe_val = _trailing_4q_roe()
+    q = q_roe_val if q_roe_val is not None else ann_vals[-1]  # proxy
+
+    con1 = None
+    for v in (con_roe_raw or []):
+        if v:
+            con1 = _norm(v)
+            break
+
+    if con1 is not None:
+        # 컨센서스 있음: 실적3년 + 분기 + 컨센(1:2:3:3:3) / 12
+        vals5 = recent3 + [q, con1]
+        w5    = w3 + [3, 3]
+        roe   = sum(v*wt for v, wt in zip(vals5, w5)) / sum(w5)
+        print(f"  [ROE 가중평균] 컨센有 1:2:3:3:3 = {roe*100:.2f}%")
+    else:
+        # 컨센서스 없음: 실적3년 + 분기(1:2:3:3) / 9
+        vals4 = recent3 + [q]
+        w4    = w3 + [3]
+        roe   = sum(v*wt for v, wt in zip(vals4, w4)) / sum(w4)
+        print(f"  [ROE 가중평균] 컨센無 1:2:3:3 = {roe*100:.2f}%")
+
+    if roe is None:
+        return 0, 0, 0, {}
+
+    # ── ROE 추세 ────────────────────────────────────────────────────────────
+    _roe_trend_raw = [v for v in (ann_roe_raw or []) if v is not None]
+    if len(_roe_trend_raw) >= 2:
+        _추세 = "상승추세" if _roe_trend_raw[-1] >= _roe_trend_raw[-2] else "하락추세"
+    else:
+        _추세 = ""
+
+    # ROE 방식 레이블
+    _roe방식 = "가중평균" + ("(컨센있음)" if con1 is not None else "(컨센없음)")
+
+    # ── 기준 지배주주지분 (equity_0): 컨센서스 1년차 우선, 없으면 연간 최신 ──
+    # 컨센서스 있으면 1순위 모드 → 컨센서스 1년차 지배주주지분 사용
+    # 컨센서스 없으면 가중평균 모드 → 최근 연간 지배주주지분 사용
+    equity_0 = _first(con.get("지배주주지분", [])) or _last(ann.get("지배주주지분", []))
+    if not equity_0 or equity_0 <= 0:
+        return 0, 0, 0, {}
+
+    # ke 형식 통일
+    if ke and ke > 1:
+        ke = ke / 100
+    if not ke or ke <= 0:
+        ke = 0.1031
+
+    # ── 3. 발행주식수: 보통주 + 우선주 - 자기주식 ───────────────────────
+    shares = ((data.get("발행주식수_보통") or 0) +
+              (data.get("발행주식수_우선") or 0) -
+              (data.get("자기주식") or 0))
+    if shares <= 0:
+        return 0, 0, 0, {}
+
+    # ── 4. 기준시점-현재 할인: 최근결산 연말 → 오늘 경과일 ─────────────
+    try:
+        _ann_years = ann.get("years", [])
+        last_year  = int(_ann_years[-1]) if _ann_years else _date.today().year - 1
+        fiscal_end = _date(last_year, 12, 31)
+        today      = _date.today()
+        days_diff  = (fiscal_end - today).days   # 음수 = 결산 이미 지남 → 복리 증가
+    except Exception:
+        days_diff = 0
+
+    def _calc(fade: float) -> float:
+        """초과이익 지속계수 fade 로 RIM 계산, 억원 반환"""
+        pv_total = 0.0
+        eq = equity_0
+        for t in range(1, 11):
+            ni  = eq * roe                           # 지배주주순이익 (일정 ROE)
+            ri  = eq * (roe - ke) * (fade ** t)      # 초과이익: (ROE-ke)×fade^t  ← 수정
+            pv  = ri / (1 + ke) ** t                 # 현재가치
+            pv_total += pv
+            eq  += ni                                # 지배주주지분 성장
+        rim_equity = equity_0 + pv_total             # 억원 (결산기준)
+        # 기준시점-현재 할인: days_diff 음수이면 나눗셈이 복리 증가
+        rim_equity /= (1 + ke) ** (days_diff / 365)
+        return rim_equity
+
+    try:
+        v_지속   = _calc(1.0)
+        v_10감소 = _calc(0.9)
+        v_20감소 = _calc(0.8)
+
+        def _p(v: float) -> int:
+            return max(0, round(v * 1e8 / shares))
+
+        p_지속   = _p(v_지속)
+        p_10감소 = _p(v_10감소)
+        p_20감소 = _p(v_20감소)
+
+        # ── 5. 정배열/역배열 매핑 ─────────────────────────────────────
+        # 배열 파라미터 없으면 excess ROE 부호로 추정
+        #   정배열: ROE > ke  → C28=10%감소, C29=지속, C30=20%감소
+        #   역배열: ROE ≤ ke  → C28=지속,   C29=20%감소, C30=지속
+        _배열 = 배열 or ("정배열" if roe > ke else "역배열")
+        if _배열 == "정배열":
+            apt, sell, buy = p_10감소, p_지속, p_20감소
+        else:
+            apt, sell, buy = p_지속, p_20감소, p_지속
+
+        print(f"  [S-RIM Python({_배열})] 지속={p_지속:,} / 10%감소={p_10감소:,} / 20%감소={p_20감소:,}")
+        print(f"    → 적정={apt:,} / 매도={sell:,} / 매수={buy:,}  (days_diff={days_diff})")
+        meta = {
+            "roe":    roe,
+            "ke":     ke,
+            "배열":   _배열,
+            "추세":   _추세,
+            "q_roe":  q_roe_val,
+            "roe방식": _roe방식,
+        }
+        return apt, sell, buy, meta
+
+    except Exception as e:
+        print(f"  [S-RIM Python 오류] {e}")
+        return 0, 0, 0, {}
+
+
+def _build_result(data: dict, name: str, code: str,
+                  ke: float, apt: int, sell: int, buy: int, meta: dict) -> dict:
+    """
+    S-RIM 결과 dict 빌드 — Excel 파일 의존 없음.
+    ke, apt/sell/buy, meta 는 _compute_ke() + _srim_python() 에서 전달받음.
+    """
     ann = data.get("annual", {})
     con = data.get("consensus", {})
     qtr = data.get("quarter", {})
     ind = data.get("industry", {})
 
     현재가   = data.get("현재가", 0) or 0
-    # 현재가=0 → 상장폐지/거래정지 종목
+    # 현재가=0 → 상장폐지/거래정지 종목 → 에러 대신 안내 결과 반환
     if not 현재가:
-        raise ValueError("현재가 없음 (상장폐지·거래정지 종목으로 추정)")
+        return {
+            "name": name, "code": code,
+            "market": data.get("_market", "KOSPI"),
+            "현재가": 0,
+            "거래정지": True,
+            "거래정지_메시지": "현재가 정보가 없습니다. 거래정지·상장폐지·매매거래중단 종목일 수 있습니다.",
+            "change_rate": 0, "change_diff": 0, "change_up": True,
+            "collected_at": data.get("meta", {}).get("collected_at", ""),
+            "적정주가": 0, "매수가격": 0, "매도가격": 0,
+            "현재가대비": 0, "roe방식": "", "roe추정": 0,
+            "할인율": 10.31, "추세": "", "배열": "", "roe수준": "",
+            "roe_history": [], "q_roe": None, "con_history": [],
+            "op_history": [], "지표": {}, "risk": [], "xlsx": "",
+            "events": {"positive": [], "negative": []},
+        }
 
-    # ── 금융/보험/지주 업종 판별 ──────────────────────────
-    # 매출액이 빈 리스트 = FnGuide 금융업 미집계 → 금융/보험/지주
+    # ── 금융/보험/지주 업종 감지 (표시 목적) ─────────────────
     _is_finance = not bool(ann.get("매출액", []))
 
     def _last(lst):
         return next((v for v in reversed(lst or []) if v is not None), None)
 
-    if _is_finance:
-        # B안: PBR-ROE 모델 (금융업계 표준)
-        # 적정PBR = ROE / ke  →  적정주가 = 적정PBR × BPS
-        # ROE가 높을수록 적정주가 높아짐 → "돈을 잘 버는 기업" 반영
-        # ke = BBB- 5년 할인율 (S-RIM과 동일 기준)
-        _con_roe = _last(con.get("ROE", []))
-        _ann_roe = _last(ann.get("ROE", []))
-        _con_bps = _last(con.get("BPS", []))
-        _ann_bps = _last(ann.get("BPS", []))
+    # ── S-RIM 결과: Python 계산값 직접 사용 ─────────────────
+    적정주가 = max(0, apt)
+    매도가격 = sell
+    매수가격 = buy
 
-        _roe = _con_roe or _ann_roe or 0   # 컨센서스 ROE 우선
-        _bps = _con_bps or _ann_bps or 0   # 컨센서스 BPS 우선
-        _ke  = cv("C17") or 0.1031         # 할인율 (엑셀 또는 기본값)
+    # meta에서 파생 지표 추출
+    _roe_from_meta = meta.get("roe")           # 소수 (0.1111 등)
+    _ke_from_meta  = meta.get("ke") or ke      # 소수
+    roe방식  = meta.get("roe방식", "가중평균")
+    배열     = meta.get("배열", "")
+    추세     = meta.get("추세", "")
+    q_roe_meta = meta.get("q_roe")             # 소수 or None
 
-        # BPS 없으면 지배주주지분으로 역산
-        if not _bps:
-            _cap = _last(ann.get("지배주주지분", []))
-            _sh  = (data.get("발행주식수_보통", 0) or 0) - (data.get("자기주식", 0) or 0)
-            if _cap and _sh > 0:
-                _bps = round(_cap * 1e8 / _sh)
+    # roe추정: meta에서 우선, 없으면 연간 최신 ROE
+    _roe_last_dec = _last(ann.get("ROE", []))  # 소수 (0.0841 등)
+    roe추정  = _roe_from_meta if _roe_from_meta is not None else (_roe_last_dec or 0)
+    할인율   = ke                               # _compute_ke() 결과 (소수)
 
-        if _roe > 0 and _bps > 0 and _ke > 0:
-            # ROE가 1 이상이면 % 단위로 저장된 것 → 소수로 변환
-            _roe_dec = _roe / 100 if _roe > 1 else _roe
-            적정pbr  = min(_roe_dec / _ke, 3.0)  # 상한 3배 제한
-            적정주가 = round(적정pbr * _bps)
-            roe방식  = "PBR-ROE모델"
-            print(f"  [금융/보험] ROE({_roe_dec*100:.1f}%)÷ke({_ke*100:.1f}%)={적정pbr:.2f}배 × BPS({_bps:,}) → {적정주가:,}원")
-        else:
-            적정주가 = 0
-            roe방식  = "금융업(계산불가)"
-            print(f"  [금융/보험] 데이터 부족 (ROE={_roe}, BPS={_bps})")
+    # roe수준
+    roe수준  = ""
+    if _roe_from_meta is not None:
+        roe수준 = "ROE>요구수익" if _roe_from_meta > ke else "ROE<요구수익"
 
-        적정주가  = max(0, 적정주가)
-        매수가격  = round(적정주가 * 0.8)
-        매도가격  = round(적정주가 * 1.2)
-    else:
-        # 일반기업: 기존 S-RIM
-        적정주가  = round(cv("C28")) if cv("C28") else 0
-        매도가격  = round(cv("C29")) if cv("C29") else 0
-        매수가격  = round(cv("C30")) if cv("C30") else 0
-        # 적정주가 음수 방지
-        if 적정주가 < 0:
-            적정주가 = 0
-        roe방식  = cv("C20") or "가중평균"
+    # q_roe (% 변환)
+    h22 = q_roe_meta if q_roe_meta is not None else 0
 
-    # ─────────────────────────────────────────────────────
     현재가대비 = round((현재가 / 적정주가 - 1) * 100, 1) if 적정주가 else 0
-    roe방식  = roe방식 if _is_finance else (cv("C20") or "가중평균")
-    roe추정  = round(_last(ann.get("ROE", [])) * 100, 2) if _is_finance else (cv("D20") or 0)
-    할인율   = cv("C17") or 0.1031
-    추세    = "" if _is_finance else (cv("I21") or "")
-    배열    = "" if _is_finance else (cv("F31") or "")
-    roe수준  = "" if _is_finance else (cv("G31") or "")
-    h22    = 0 if _is_finance else (cv("H22") or 0)
+
+    # ── 적정주가 계산불가 판단 ────────────────────────────
+    # 자본잠식 심화 / 극적자 종목은 S-RIM 결과가 0 또는 음수로 수렴
+    _roe_last = _last(ann.get("ROE", []))
+    _계산불가 = False
+    _계산불가_메시지 = ""
+    if 적정주가 == 0:
+        if _roe_last is not None and _roe_last < -0.5:  # ROE -50% 미만 (심각한 자본잠식)
+            _계산불가 = True
+            _계산불가_메시지 = f"자본잠식 심화로 S-RIM 계산불가 (ROE {round(_roe_last*100,1)}%)"
+        elif not ann.get("years"):
+            _계산불가 = True
+            _계산불가_메시지 = "실적 데이터가 없어 계산불가 (신규상장·데이터미수집 종목)"
+        else:
+            _계산불가 = True
+            _계산불가_메시지 = "ROE가 요구수익률보다 낮아 S-RIM 적정주가 산출불가"
 
     # 추세/배열/ROE수준 폴백
     if not 추세:
@@ -281,7 +494,7 @@ def _build_result(data: dict, xlsx_path: str, name: str, code: str) -> dict:
     roe_history = [{"year": y, "roe": round((v or 0) * 100, 2)}
                    for y, v in zip(roe_years, roe_values)]
 
-    q_roe = round(h22 * 100, 2) if isinstance(h22, float) else None
+    q_roe = round(h22 * 100, 2) if isinstance(h22, (int, float)) and h22 else None
 
     con_years   = con.get("years", [])[:2]
     con_roes    = [round((v or 0) * 100, 2) for v in con.get("ROE", [])[:2]]
@@ -299,14 +512,19 @@ def _build_result(data: dict, xlsx_path: str, name: str, code: str) -> dict:
         "change_rate": chg.get("rate") or 0,
         "change_diff": chg.get("diff") or 0,
         "change_up":   chg.get("up", True),
+        "year_high":   chg.get("year_high") or 0,
+        "year_low":    chg.get("year_low") or 0,
         "collected_at": data.get("meta", {}).get("collected_at", ""),
         "현재가":    현재가,
+        "거래정지":  False,
+        "계산불가":  _계산불가,
+        "계산불가_메시지": _계산불가_메시지,
         "적정주가":  적정주가,
         "매수가격":  매수가격,
         "매도가격":  매도가격,
         "현재가대비": round(현재가대비, 1),
         "roe방식":   roe방식,
-        "roe추정":   roe추정 if _is_finance else round((roe추정 or 0) * 100, 2),
+        "roe추정":   round((roe추정 or 0) * 100, 2),   # 소수→% 변환 (금융업 포함 통일)
         "할인율":    round(할인율 * 100, 2),
         "추세":      str(추세),
         "배열":      str(배열),
@@ -316,14 +534,33 @@ def _build_result(data: dict, xlsx_path: str, name: str, code: str) -> dict:
         "con_history": con_history,
         "op_history":  [{"year": y, "op": round(v or 0)}
                         for y, v in zip(ann.get("years",[]), ann.get("영업이익",[]))],
-        "지표": _build_indicators_v2(data, ann, ind, roe추정, 시가총액, cv("C17", 0.1031)),
+        "지표": _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke),
+        "민감도": _build_sensitivity(data, ke, meta),
         "risk": risk,
-        "xlsx": str(xlsx_path),
+        "xlsx": "",  # _run_job에서 Excel 생성 후 덮어씀
         "events": {
             "positive": [e for e in data.get("_events", []) if e.get("type") == "positive"],
             "negative": [e for e in data.get("_events", []) if e.get("type") == "negative"],
         },
     }
+
+
+def _build_sensitivity(data: dict, ke: float, meta: dict) -> dict:
+    """
+    ④ 적정주가 민감도 분석: ke ±1%, ±2% 변동 시 적정주가 변화량 반환
+    배열(정배열/역배열)은 현재 ke 기준으로 고정 — 경계값에서 결과 왜곡 방지
+    """
+    try:
+        fixed_배열 = meta.get("배열", "")  # 현재 배열 고정
+        result = {}
+        for delta_pct in [-2, -1, 1, 2]:
+            ke_adj = round(ke + delta_pct / 100, 4)
+            ke_adj = max(0.03, min(ke_adj, 0.30))
+            apt_adj, _, _, _ = _srim_python(data, ke_adj, 배열=fixed_배열)
+            result[f"ke{'+' if delta_pct>0 else ''}{delta_pct}%"] = apt_adj
+        return result
+    except Exception:
+        return {}
 
 
 def _check_risk(ann: dict, 현재가: float, 발행주식수: int,
@@ -425,9 +662,9 @@ def _check_risk(ann: dict, 현재가: float, 발행주식수: int,
         items.append({"name":"영업이익","status":s,"msg":m,
                       "std":"연속 영업적자 시 상장적격성 심사","loss_yrs":loss_yrs})
 
-    # 세전계속사업이익 (finance 데이터 있을 때만)
+    # 세전계속사업이익 (finance 데이터 있을 때만, 금융주 제외)
     pretax_list = [v for v in finance.get("세전계속사업이익", []) if v is not None]
-    if pretax_list:
+    if pretax_list and not 매출액_없음:  # 금융주 제외
         pretax_loss = sum(1 for v in pretax_list[-3:] if v < 0)
         pretax_last = pretax_list[-1]
         if   pretax_loss >= 2: s, m = "danger", f"{pretax_last:,.0f}억원  (최근 {pretax_loss}년 손실)"
@@ -436,10 +673,10 @@ def _check_risk(ann: dict, 현재가: float, 발행주식수: int,
         items.append({"name":"세전계속사업이익","status":s,"msg":m,
                       "std":"법인세비용차감전 계속사업이익 손실 여부"})
 
-    # 단기차입금 vs 이익잉여금
+    # 단기차입금 vs 이익잉여금 (금융주 제외 — 금융업은 차입금이 영업 본질)
     sb_list = [v for v in finance.get("단기차입금", []) if v is not None]
     re_list = [v for v in finance.get("이익잉여금", []) if v is not None]
-    if sb_list and re_list:
+    if sb_list and re_list and not 매출액_없음:  # 금융주 제외
         sb = sb_list[-1]; re = re_list[-1]
         if   sb > re:        s, m = "danger", f"단기차입금 {sb:,.0f}억 > 이익잉여금 {re:,.0f}억"
         elif sb > re * 0.7:  s, m = "warn",   f"단기차입금 {sb:,.0f}억 (이익잉여금의 {sb/re*100:.0f}%)"
@@ -513,6 +750,100 @@ def api_version():
     return jsonify({"version": "20260319-clean"})
 
 
+# ── 포트폴리오 API ────────────────────────────────────────
+
+PORTFOLIO_FILE = BASE / "portfolio.json"
+
+def _load_pf():
+    if PORTFOLIO_FILE.exists():
+        try:
+            return json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"holdings": []}
+
+def _save_pf(data: dict):
+    PORTFOLIO_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+@app.route("/api/portfolio", methods=["GET"])
+def api_portfolio():
+    """포트폴리오 목록 + 보유 종목 현재가 자동 조회"""
+    pf = _load_pf()
+    sys.path.insert(0, str(BASE))
+    import stock_search as _ss
+    importlib.reload(_ss)
+    for h in pf["holdings"]:
+        if h.get("status") == "holding":
+            try:
+                ov = _ss.get_stock_ohlcv(h["code"])
+                h["current_price"] = ov.get("price", 0)
+                h["rate"]          = ov.get("rate", 0)
+                h["up"]            = ov.get("up", True)
+            except Exception:
+                h.setdefault("current_price", 0)
+                h.setdefault("rate", 0)
+                h.setdefault("up", True)
+    return jsonify(pf)
+
+
+@app.route("/api/portfolio/add", methods=["POST"])
+def api_portfolio_add():
+    """종목 추가"""
+    import uuid
+    body = request.get_json() or {}
+    pf   = _load_pf()
+    entry = {
+        "id":                str(uuid.uuid4())[:8],
+        "code":              body.get("code", ""),
+        "name":              body.get("name", ""),
+        "buy_price":         float(body.get("buy_price", 0)),
+        "apt_price":         float(body.get("apt_price", 0)),
+        "sell_target":       float(body.get("sell_target", 0)),
+        "quantity":          int(body.get("quantity", 1)),
+        "buy_date":          body.get("buy_date", datetime.now().strftime("%Y-%m-%d")),
+        "ke":                body.get("ke"),
+        "roe":               body.get("roe"),
+        "배열":               body.get("배열", ""),
+        "status":            "holding",
+        "sell_date":         None,
+        "sell_actual_price": None,
+        "memo":              body.get("memo", ""),
+    }
+    pf["holdings"].append(entry)
+    _save_pf(pf)
+    return jsonify({"ok": True, "id": entry["id"]})
+
+
+@app.route("/api/portfolio/sell/<item_id>", methods=["POST"])
+def api_portfolio_sell(item_id):
+    """매도 처리 — 실제 매도가 기록"""
+    body = request.get_json() or {}
+    sell_price = body.get("sell_price")
+    if not sell_price:
+        return jsonify({"error": "매도가 필요"}), 400
+    pf = _load_pf()
+    for h in pf["holdings"]:
+        if h["id"] == item_id:
+            h["status"]            = "sold"
+            h["sell_date"]         = datetime.now().strftime("%Y-%m-%d")
+            h["sell_actual_price"] = float(sell_price)
+            break
+    _save_pf(pf)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/portfolio/<item_id>", methods=["DELETE"])
+def api_portfolio_delete(item_id):
+    """항목 삭제"""
+    pf = _load_pf()
+    pf["holdings"] = [h for h in pf["holdings"] if h["id"] != item_id]
+    _save_pf(pf)
+    return jsonify({"ok": True})
+
+
 def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
     def _last(lst):
         return next((v for v in reversed(lst or []) if v is not None), None)
@@ -529,6 +860,21 @@ def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
     배당여부=bool(dps and dps>0)           # 최근연도 배당 여부
     배당중단=bool(not dps and dps_last_valid)  # 과거엔 했는데 최근 중단
     배당3년연속=len(dps_list)>=3 and all(v>0 for v in dps_list)
+    # ── 시가배당수익률 (현재가 기준 DPS) ──────────────────────
+    현재가_배당 = data.get("현재가", 0) or 0
+    con_dps_list = data.get("consensus", {}).get("DPS", [])
+    con_dps1 = next((v for v in con_dps_list if v), None)   # 컨센서스 DPS 1년차
+
+    시가배당수익률 = None
+    예상시가배당수익률 = None
+    try:
+        if dps_last_valid and 현재가_배당 > 0:
+            시가배당수익률 = round(dps_last_valid / 현재가_배당 * 100, 2)
+        if con_dps1 and 현재가_배당 > 0:
+            예상시가배당수익률 = round(con_dps1 / 현재가_배당 * 100, 2)
+    except Exception:
+        pass
+
     dcf_per_share=dcf_판정=None
     try:
         fin=data.get("finance",{})
@@ -627,6 +973,90 @@ def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
     except Exception:
         pass
 
+    # ── ① ROE 안정성 ────────────────────────────────────────
+    roe_std = None
+    roe_range = None
+    roe_stability_msg = None
+    try:
+        import statistics as _stat
+        roe_vals_raw = [v for v in (ann.get("ROE") or []) if v is not None]
+        # 소수형(0.15) 또는 정수형(15.0) 통일 → %로 변환
+        roe_vals_pct = [(v * 100 if abs(v) <= 2 else v) for v in roe_vals_raw]
+        if len(roe_vals_pct) >= 2:
+            roe_std   = round(_stat.stdev(roe_vals_pct), 2)
+            roe_range = round(max(roe_vals_pct) - min(roe_vals_pct), 2)
+            # 안정성 레이블 (표준편차 기준)
+            if roe_std < 3:
+                roe_stability_msg = f"안정 (표준편차 {roe_std:.1f}%p)"
+            elif roe_std < 7:
+                roe_stability_msg = f"보통 (표준편차 {roe_std:.1f}%p)"
+            else:
+                roe_stability_msg = f"변동 큼 (표준편차 {roe_std:.1f}%p)"
+    except Exception:
+        pass
+
+    # ── ③ 이자보상배율 ──────────────────────────────────────
+    이자보상배율 = None
+    이자보상배율_msg = None
+    try:
+        fin = data.get("finance", {})
+        interest_list = [v for v in (fin.get("이자비용") or []) if v is not None and v > 0]
+        op_list_raw   = ann.get("영업이익", [])
+        op_last       = _last(op_list_raw)
+        interest_last = interest_list[-1] if interest_list else None
+        if interest_last and interest_last > 0 and op_last is not None:
+            이자보상배율 = round(op_last / interest_last, 2)
+            if 이자보상배율 >= 5:
+                이자보상배율_msg = f"{이자보상배율:.1f}배 (양호 — 이자 부담 낮음)"
+            elif 이자보상배율 >= 1.5:
+                이자보상배율_msg = f"{이자보상배율:.1f}배 (보통)"
+            elif 이자보상배율 >= 1.0:
+                이자보상배율_msg = f"{이자보상배율:.1f}배 (주의 — 이자 부담 높음)"
+            else:
+                이자보상배율_msg = f"{이자보상배율:.1f}배 (위험 — 영업이익으로 이자 미충당)"
+    except Exception:
+        pass
+
+    # ── ② FCF (잉여현금흐름) 실계산 ────────────────────────
+    fcf_actual      = None   # 영업CF - CAPEX (억원)
+    fcf_per_share   = None   # 주당 FCF (원)
+    fcf_yield       = None   # FCF 수익률 (현재가 대비)
+    fcf_msg         = None
+    try:
+        fin2 = data.get("finance", {})
+        op_cf_list  = [v for v in (fin2.get("영업CF") or []) if v is not None]
+        capex_list  = [v for v in (fin2.get("CAPEX") or []) if v is not None]
+        shrx2 = data.get("발행주식수_보통", 0) or 0
+        현재가2 = data.get("현재가", 0) or 0
+        if op_cf_list and capex_list and shrx2 > 0:
+            # 공통 기간 최소값 기준
+            n_fcf = min(len(op_cf_list), len(capex_list), 3)
+            op_cf_r  = op_cf_list[-n_fcf:]
+            capex_r  = capex_list[-n_fcf:]
+            fcf_list = [o - c for o, c in zip(op_cf_r, capex_r)]
+            # 가중평균 (최근 연도 높은 가중치)
+            w_fcf = list(range(1, n_fcf + 1))
+            fcf_avg = sum(f * w for f, w in zip(fcf_list, w_fcf)) / sum(w_fcf)
+            fcf_actual = round(fcf_avg)
+            fcf_per_share = round(fcf_avg * 1e8 / shrx2)
+            if 현재가2 > 0 and fcf_per_share > 0:
+                fcf_yield = round(fcf_per_share / 현재가2 * 100, 2)
+                if fcf_yield >= 5:
+                    fcf_msg = f"FCF수익률 {fcf_yield:.1f}% (양호)"
+                elif fcf_yield >= 2:
+                    fcf_msg = f"FCF수익률 {fcf_yield:.1f}% (보통)"
+                elif fcf_yield > 0:
+                    fcf_msg = f"FCF수익률 {fcf_yield:.1f}% (낮음)"
+                else:
+                    fcf_msg = f"FCF 음수 (잉여현금 창출 못함)"
+            elif fcf_per_share is not None and fcf_per_share <= 0:
+                fcf_msg = "FCF 음수 (잉여현금 창출 못함)"
+        elif op_cf_list and shrx2 > 0:
+            # CAPEX 없으면 영업CF * 0.7 추정 (기존 방식 유지)
+            pass  # dcf_per_share 로직에서 이미 처리됨
+    except Exception:
+        pass
+
     # ── 베타 ────────────────────────────────────────────────
     베타 = data.get("베타")
 
@@ -643,13 +1073,27 @@ def _build_indicators_v2(data, ann, ind, roe추정, 시가총액, ke=0.1031):
         "op_margin_msg":op_margin_msg,
         "eps_yoy_msg":eps_yoy_msg,
         "con_eps_msg":con_eps_msg,
+        "시가배당수익률":시가배당수익률,
+        "예상시가배당수익률":예상시가배당수익률,
         "배당성향":배당성향,"배당여부":배당여부,"배당중단":배당중단,"배당3년연속":배당3년연속,
         "DCF":dcf_per_share,
-        "외국인순매수":inv.get("외국인_순매수"),"기관순매수":inv.get("기관_순매수"),
-        "개인순매수":inv.get("개인_순매수"),"외국인매수":inv.get("외국인_매수"),
-        "외국인매도":inv.get("외국인_매도"),"기관매수":inv.get("기관_매수"),
-        "기관매도":inv.get("기관_매도"),"개인매수":inv.get("개인_매수"),
-        "개인매도":inv.get("개인_매도"),
+        # ── ① ROE 안정성
+        "ROE표준편차":roe_std,
+        "ROE변동범위":roe_range,
+        "ROE안정성":roe_stability_msg,
+        # ── ③ 이자보상배율
+        "이자보상배율":이자보상배율,
+        "이자보상배율_msg":이자보상배율_msg,
+        # ── ② FCF 실계산
+        "FCF":fcf_actual,
+        "FCF주당":fcf_per_share,
+        "FCF수익률":fcf_yield,
+        "FCF_msg":fcf_msg,
+        "외국인순매수":inv.get("외국인_순매수"),"연기금순매수":inv.get("연기금_순매수"),
+        "기관순매수":inv.get("기관_순매수"),"개인순매수":inv.get("개인_순매수"),
+        "연기금5일합산":inv.get("연기금_5일합산"),
+        "투자자날짜":inv.get("전일날짜",""),
+        "투자자5일":inv.get("5일",[]),
         "PER판정":_j(per,10,25),"PBR판정":_j(pbr,1.0,3.0),
         "EV판정":_j(ev,6,15),"DCF판정":dcf_판정,
         "배당판정":_j(배당수익률,2.0,999,rev=True) if 배당수익률 else None,
@@ -696,11 +1140,12 @@ def api_stocklist():
                             "market": item[2] if len(item) > 2 else ""
                         })
             return jsonify({"list": result, "count": len(result)})
-        # 캐시 없으면 stock_search에서 로딩 시도
+        # 캐시 없으면 stock_search.get_stock_map() 으로 로딩
         sys.path.insert(0, str(BASE))
         import stock_search as _ss; importlib.reload(_ss)
-        items = _ss.load_stock_list() if hasattr(_ss, "load_stock_list") else []
-        result = [{"name":s[0],"code":s[1],"market":s[2] if len(s)>2 else ""} for s in items]
+        stock_map = _ss.get_stock_map()
+        result = [{"name": n, "code": v[0], "market": v[1] if len(v) > 1 else ""}
+                  for n, v in stock_map.items()]
         return jsonify({"list": result, "count": len(result)})
     except Exception as e:
         return jsonify({"list": [], "error": str(e)})
