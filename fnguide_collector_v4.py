@@ -16,15 +16,34 @@ HEADERS = {
     "Referer": "https://comp.fnguide.com/",
 }
 
-def _get(url):
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    r.encoding = "utf-8"
-    soup = BeautifulSoup(r.text, "html.parser")
-    # script 태그 제거 (JS 코드 안의 id 문자열이 파싱 방해 방지)
-    for tag in soup.find_all("script"):
-        tag.decompose()
-    return soup
+def _get(url, retries=3, timeout=20):
+    """FnGuide HTTP GET — 타임아웃/연결오류 시 최대 retries회 재시도"""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            r.encoding = "utf-8"
+            soup = BeautifulSoup(r.text, "html.parser")
+            # script 태그 제거 (JS 코드 안의 id 문자열이 파싱 방해 방지)
+            for tag in soup.find_all("script"):
+                tag.decompose()
+            return soup
+        except requests.exceptions.Timeout as e:
+            last_err = e
+            wait = attempt * 5  # 5초, 10초, 15초 간격
+            print(f"  [타임아웃] {attempt}/{retries}회 — {wait}초 후 재시도...")
+            time.sleep(wait)
+        except requests.exceptions.ConnectionError as e:
+            last_err = e
+            wait = attempt * 5
+            print(f"  [연결오류] {attempt}/{retries}회 — {wait}초 후 재시도...")
+            time.sleep(wait)
+        except requests.exceptions.HTTPError:
+            raise  # HTTP 오류(404, 500 등)는 재시도 없이 바로 예외
+    raise requests.exceptions.Timeout(
+        f"FnGuide 응답 없음 ({retries}회 재시도 실패): {url}"
+    ) from last_err
 
 def _num(s) -> Optional[float]:
     if s is None: return None
@@ -121,40 +140,129 @@ def collect(name, code):
         price_tag = soup.find("span", id="svdMainChartTxt11")
         result["현재가"] = _num(price_tag.get_text(strip=True)) if price_tag else None
 
-    # ── 투자자별 순매수 (네이버 m.stock investorByDay API)
+    # ── 52주 고/저가 (FnGuide soup에서 추출)
     try:
-        import requests as _req
-        from datetime import datetime as _dt
-        _biz = _dt.today().strftime("%Y%m%d")
-        _ir = _req.get(
-            f"https://m.stock.naver.com/api/stock/{code}/investorByDay?bizdate={_biz}",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            timeout=6
-        )
-        if _ir.status_code == 200:
-            _id = _ir.json()
-            # 응답이 리스트인 경우 당일(첫 번째) 데이터 사용
-            if isinstance(_id, list) and _id:
-                _id = _id[0]
-            def _to_억(v):
-                try: return round(int(str(v).replace(",","")) / 1e8, 1)
-                except: return None
-            result["투자자"] = {
-                "_raw_keys": list(_id.keys())[:20],
-                "외국인_순매수": _to_억(_id.get("foreignerNetBuyPrice") or _id.get("foreignerNet") or _id.get("frgNetBuyAmt")),
-                "기관_순매수":   _to_억(_id.get("organNetBuyPrice")    or _id.get("organNet")    or _id.get("orgNetBuyAmt")),
-                "개인_순매수":   _to_억(_id.get("individualNetBuyPrice") or _id.get("individualNet") or _id.get("indNetBuyAmt")),
-                "외국인_매수":   _to_억(_id.get("foreignerBuyPrice")  or _id.get("foreignerBuy")),
-                "외국인_매도":   _to_억(_id.get("foreignerSellPrice") or _id.get("foreignerSell")),
-                "기관_매수":     _to_억(_id.get("organBuyPrice")      or _id.get("organBuy")),
-                "기관_매도":     _to_억(_id.get("organSellPrice")     or _id.get("organSell")),
-                "개인_매수":     _to_억(_id.get("individualBuyPrice") or _id.get("individualBuy")),
-                "개인_매도":     _to_억(_id.get("individualSellPrice") or _id.get("individualSell")),
-            }
-        else:
-            result["투자자"] = {"_status": _ir.status_code}
+        # svdMainChartTxt* ID 들의 텍스트를 확인
+        _chart_txts = {}
+        for i in range(11, 30):
+            tag = soup.find(attrs={"id": f"svdMainChartTxt{i}"})
+            if tag:
+                _chart_txts[f"Txt{i}"] = tag.get_text(strip=True)
+        print(f"  [FnGuide ChartTxt] {_chart_txts}")
     except Exception as _e:
-        result["투자자"] = {"_error": str(_e)}
+        print(f"  [52주 디버그 오류] {_e}")
+
+    # ── 투자자별 순매수 수집 (pykrx — 전일 확정 + 5일 추이 + 연기금 포함)
+    def _collect_investor_krx(code_6: str) -> dict:
+        """
+        pykrx로 투자자별 순매수 수집 (Daum API 우회 제거)
+        - get_market_trading_value_by_investor(strt5, end, code) → 5일 합산 (외국인/연기금/기관/개인)
+        - get_market_trading_value_by_date(strt5, end, code, on="순매수") → 일별 추이 (바차트용)
+        """
+        from datetime import datetime, timedelta
+
+        # 최근 5 영업일 범위 계산
+        _dates: list = []
+        _d = datetime.now() - timedelta(days=1)
+        while len(_dates) < 10:
+            if _d.weekday() < 5:
+                _dates.append(_d.strftime("%Y%m%d"))
+            _d -= timedelta(days=1)
+        _dates.sort()
+        strt5 = _dates[-5]
+        end   = _dates[-1]
+
+        try:
+            from pykrx import stock as _s
+
+            # ── Call A: 5일 합산 투자자별 순매수 (거래대금 기준, 연기금 포함)
+            df_total = _s.get_market_trading_value_by_investor(strt5, end, code_6)
+            if df_total is None or df_total.empty:
+                print(f"  [pykrx 수급] 투자자 합산 데이터 없음")
+                return {}
+
+            순매수_col = next((c for c in df_total.columns if "순매수" in c), None)
+            if not 순매수_col:
+                print(f"  [pykrx 수급] 순매수 컬럼 없음: {list(df_total.columns)}")
+                return {}
+
+            def _inv(keys):
+                for k in keys:
+                    if k in df_total.index:
+                        return round(float(df_total.loc[k, 순매수_col] or 0) / 1e8, 1)
+                return None
+
+            for_5일 = _inv(["외국인합계", "외국인"])
+            pen_5일 = _inv(["연기금 등", "연기금등", "연기금"])
+            org_5일 = _inv(["기관합계"])
+            ind_5일 = _inv(["개인"])
+
+            # ── Call B: 일별 순매수 추이 (바차트 + 전일값)
+            rows_5   = []
+            for_전일 = for_5일
+            org_전일 = org_5일
+            ind_전일 = ind_5일
+            전일날짜  = f"{end[:4]}.{end[4:6]}.{end[6:]}"
+
+            try:
+                df_daily = _s.get_market_trading_value_by_date(strt5, end, code_6, on="순매수")
+                if df_daily is not None and not df_daily.empty:
+                    col_f = next((c for c in df_daily.columns if "외국인" in c), None)
+                    col_i = next((c for c in df_daily.columns if "기관" in c), None)
+                    col_p = next((c for c in df_daily.columns if "개인" in c), None)
+
+                    for dt_idx in df_daily.index:
+                        dt_str = str(dt_idx)
+                        # pandas Timestamp → YYYYMMDD 문자열 변환
+                        if hasattr(dt_idx, "strftime"):
+                            dt_str = dt_idx.strftime("%Y%m%d")
+                        if len(dt_str) == 8:
+                            dt_str = f"{dt_str[:4]}.{dt_str[4:6]}.{dt_str[6:]}"
+                        row = df_daily.loc[dt_idx]
+                        rows_5.append({
+                            "날짜":   dt_str,
+                            "외국인": round(float(row[col_f] or 0) / 1e8, 1) if col_f else None,
+                            "기관":   round(float(row[col_i] or 0) / 1e8, 1) if col_i else None,
+                            "개인":   round(float(row[col_p] or 0) / 1e8, 1) if col_p else None,
+                        })
+
+                    # 전일(마지막 행)값 → 전일 순매수 박스에 사용
+                    if rows_5:
+                        last = rows_5[-1]
+                        for_전일 = last["외국인"]
+                        org_전일 = last["기관"]
+                        ind_전일 = last["개인"]
+                        전일날짜  = last["날짜"]
+
+                    # 최신→오래된 순 (index.html에서 .reverse()로 차트 렌더링)
+                    rows_5 = list(reversed(rows_5))
+
+            except Exception as _e:
+                print(f"  [pykrx 일별] {_e}")
+
+            print(f"  수급 수집완료(pykrx): {전일날짜} "
+                  f"외국인={for_전일}억 연기금={pen_5일}억(5일합산) "
+                  f"기관={org_전일}억 개인={ind_전일}억")
+
+            return {
+                "전일날짜":      전일날짜,
+                "외국인_순매수": for_전일,   # 전일 값
+                "연기금_순매수": pen_5일,    # 5일 합산 (일별 미제공)
+                "기관_순매수":   org_전일,   # 전일 값
+                "개인_순매수":   ind_전일,   # 전일 값
+                "연기금_5일합산": pen_5일,   # 5일 누적 박스용
+                "5일":           rows_5,
+            }
+
+        except Exception as _e:
+            print(f"  [pykrx 수급 오류] {_e}")
+            return {}
+
+    try:
+        result["투자자"] = _collect_investor_krx(code)
+    except Exception as _e:
+        print(f"  [수급 수집 실패] {_e}")
+        result["투자자"] = {}
 
     # ── 모든 테이블 파싱
     parsed = [_parse_table(tbl) for tbl in all_tables]
@@ -461,6 +569,7 @@ def collect(name, code):
             "배당수익률": [v/100 if v is not None else None for v in annual_est.get("배당수익률", [])],
         },
         "industry": industry,
+        "투자자": result.get("투자자", {}),   # ← 수급 데이터 반드시 포함
     }
 
     # ── SVD_Finance에서 단기차입금, 이익잉여금, 세전계속사업이익 수집
@@ -496,13 +605,57 @@ def collect(name, code):
         if not pretax_profit:
             pretax_profit = _get_row_vals("divSonikY", "법인세비용차감전")
 
+        # 이자비용 (divSonikY) — 여러 행명 후보 시도
+        interest_exp = _get_row_vals("divSonikY", "이자비용")
+        if not interest_exp:
+            interest_exp = _get_row_vals("divSonikY", "금융비용")
+        if not interest_exp:
+            interest_exp = _get_row_vals("divSonikY", "이자비용및유사비용")
+
+        # 현금흐름표 연간 — div ID 후보 순서대로 탐색
+        _cf_div_ids = ["divCfY", "divCashY", "divCashFlowY"]
+        cf_div_id = None
+        for _did in _cf_div_ids:
+            if fin_soup.find("div", id=_did):
+                cf_div_id = _did
+                break
+
+        if cf_div_id:
+            cf_years = _get_years(cf_div_id)
+            # 영업CF: 여러 행명 후보
+            op_cf = []
+            for _lbl in ("영업활동으로인한현금흐름", "영업현금흐름", "영업활동현금흐름",
+                         "I.영업활동으로인한현금흐름", "I.영업활동현금흐름",
+                         "1.영업활동으로인한현금흐름"):
+                op_cf = _get_row_vals(cf_div_id, _lbl)
+                if op_cf: break
+            # CAPEX: 여러 행명 후보 (FnGuide는 음수로 표기)
+            capex = []
+            for _lbl in ("유형자산의취득", "설비투자", "유형자산취득",
+                         "유형자산의증가", "유형자산취득액", "토지및건물의취득"):
+                capex = _get_row_vals(cf_div_id, _lbl)
+                if capex: break
+            # CAPEX 절대값 저장
+            capex = [abs(v) if v is not None else None for v in capex]
+        else:
+            cf_years, op_cf, capex = [], [], []
+
+        # 기준 연도: 재무상태표 연도 사용
+        n = len(bs_years)
+        cf_n = len(cf_years)
+
         d["finance"] = {
-            "years":          bs_years,
-            "단기차입금":     short_borrow[:len(bs_years)],
-            "이익잉여금":     retained[:len(bs_years)],
-            "세전계속사업이익": pretax_profit[:len(bs_years)],
+            "years":            bs_years,
+            "단기차입금":       short_borrow[:n],
+            "이익잉여금":       retained[:n],
+            "세전계속사업이익": pretax_profit[:n],
+            "이자비용":         interest_exp[:n],
+            "영업CF":           op_cf[:cf_n],
+            "CAPEX":            capex[:cf_n],
+            "cf_years":         cf_years,
         }
         print(f"  Finance 수집: 단기차입금{short_borrow[-1:]}, 이익잉여금{retained[-1:]}, 세전{pretax_profit[-1:]}")
+        print(f"  Finance 추가: 이자비용{interest_exp[-1:]}, 영업CF{op_cf[-1:]}, CAPEX{capex[-1:]}")
     except Exception as e:
         print(f"  [Finance 수집 실패] {e}")
         d["finance"] = {}
