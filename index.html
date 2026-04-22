@@ -345,7 +345,7 @@ body{background:var(--bg);color:var(--text);font-family:'Pretendard','Apple SD G
         oninput="_renderModalAc(this.value.trim())"
         onblur="setTimeout(()=>{ const l=$('modalAcList'); if(l)l.style.display='none'; },180)"
         onkeydown="if(event.key==='Enter')modalSearch()"/>
-      <button onclick="modalSearch()">S-RIM 조회</button>
+      <button onclick="modalSearch()">적정주가 조회</button>
     </div>
     <div class="modal-ac ac-item" id="modalAcList" style="display:none"></div>
 
@@ -944,10 +944,10 @@ function _modalPoll(job_id) {
 function _fillModal(r) {
   _modalStockData = r;
   $('modalStockInfo').innerHTML = `<strong>${r.name}</strong> <span style="color:var(--muted);font-size:12px">${r.code} &ensp;현재가 ${fmt(r.현재가)}원</span>`;
-  $('modalBuyPrice').textContent  = r.매수가  ? fmt(r.매수가)+'원'  : '-';
-  $('modalAptPrice').textContent  = r.적정가  ? fmt(r.적정가)+'원'  : '-';
-  $('modalSellTarget').textContent= r.매도가  ? fmt(r.매도가)+'원'  : '-';
-  $('modalSaveBtn').disabled = !(r.매수가 && r.적정가);
+  $('modalBuyPrice').textContent  = r.매수가격  ? fmt(r.매수가격)+'원'  : '-';
+  $('modalAptPrice').textContent  = r.적정주가  ? fmt(r.적정주가)+'원'  : '-';
+  $('modalSellTarget').textContent= r.매도가격  ? fmt(r.매도가격)+'원'  : '-';
+  $('modalSaveBtn').disabled = !(r.매수가격 && r.적정주가);
 }
 async function savePortfolioItem() {
   if (!_modalStockData) return;
@@ -959,7 +959,7 @@ async function savePortfolioItem() {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
         code:r.code, name:r.name,
-        buy_price:r.매수가, apt_price:r.적정가, sell_target:r.매도가,
+        buy_price:r.매수가격, apt_price:r.적정주가, sell_target:r.매도가격,
         quantity:qty, buy_date:dt,
         ke:r.할인율, roe:r.roe추정, 배열:r.배열,
       }),
