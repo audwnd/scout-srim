@@ -501,90 +501,91 @@ def get_supply_strength(code: str, price: float) -> dict:
     # → need_investor = True인 경우만 개별 pykrx 호출 (동시 요청 폭증 방지)
     need_investor = result["foreign_buy"] is None
     if need_investor:
-        try:
-            from pykrx import stock as _s
+        # pykrx 개별 호출은 KRX 서버 응답 없을 때 무한 대기 → 10초 타임아웃 스레드로 감쌈
+        import threading as _th
 
-            def _col(df, *kws):
-                for kw in kws:
-                    c = next((c for c in df.columns if kw in c), None)
-                    if c: return c
-                return None
-
-            # 방법A: 5일 합산 투자자별 순매수 (get_market_trading_value_by_investor)
-            # 반환: 인덱스=투자자구분(금융투자/보험/.../외국인합계/연기금등/기관합계)
-            #       컬럼=매도/매수/순매수
+        def _do_investor_fetch():
             try:
-                df_sum = _s.get_market_trading_value_by_investor(strt5, end, code)
-                if df_sum is not None and not df_sum.empty:
-                    순매수_col = next((c for c in df_sum.columns if "순매수" in c), None)
-                    if 순매수_col:
-                        if result["foreign_buy"] is None:
-                            for inv in ["외국인합계", "외국인"]:
-                                if inv in df_sum.index:
-                                    result["foreign_buy"] = round(
-                                        float(df_sum.loc[inv, 순매수_col] or 0) / 1e8, 1)
-                                    break
-                        if result["pension_buy"] is None:
-                            for inv in ["연기금 등", "연기금등", "연기금"]:
-                                if inv in df_sum.index:
-                                    result["pension_buy"] = round(
-                                        float(df_sum.loc[inv, 순매수_col] or 0) / 1e8, 1)
-                                    break
-                        if result["inst_buy"] is None:
-                            if "기관합계" in df_sum.index:
-                                result["inst_buy"] = round(
-                                    float(df_sum.loc["기관합계", 순매수_col] or 0) / 1e8, 1)
-                        result["net_buy"] = round(
-                            (result["foreign_buy"] or 0) + (result["inst_buy"] or 0), 1)
-            except Exception:
-                pass
+                from pykrx import stock as _s
 
-            # 방법A-2: 날짜별 순매수 (연속일수 계산)
-            # 반환: 인덱스=날짜, 컬럼=기관합계/기타법인/개인/외국인합계/전체
-            try:
-                df_daily = _s.get_market_trading_value_by_date(strt10, end, code, on="순매수")
-                if df_daily is not None and not df_daily.empty:
-                    col_f = next((c for c in df_daily.columns if "외국인" in c), None)
-                    col_i = next((c for c in df_daily.columns if "기관" in c), None)
-                    if result["consec_days"] == 0 and (col_f or col_i):
-                        consec = 0
-                        for _, row in df_daily.iloc[::-1].iterrows():
-                            f_val = float(row[col_f] if col_f else 0 or 0)
-                            i_val = float(row[col_i] if col_i else 0 or 0)
-                            if f_val > 0 or i_val > 0:
-                                consec += 1
-                            else:
-                                break
-                        result["consec_days"] = consec
-            except Exception:
-                pass
-
-            # 방법B 폴백: 거래량 × 현재가 근사 (방법A 완전 실패 시)
-            if result["foreign_buy"] is None and price and price > 0:
+                # 방법A: 5일 합산 투자자별 순매수
                 try:
-                    df_vol = _s.get_market_trading_volume_by_investor(strt5, end, code)
-                    if df_vol is not None and not df_vol.empty:
-                        순매수_col = next((c for c in df_vol.columns if "순매수" in c), None)
+                    df_sum = _s.get_market_trading_value_by_investor(strt5, end, code)
+                    if df_sum is not None and not df_sum.empty:
+                        순매수_col = next((c for c in df_sum.columns if "순매수" in c), None)
                         if 순매수_col:
-                            for inv in ["외국인합계", "외국인"]:
-                                if inv in df_vol.index:
-                                    result["foreign_buy"] = round(
-                                        float(df_vol.loc[inv, 순매수_col] or 0) * price / 1e8, 1)
-                                    break
-                            for inv in ["연기금 등", "연기금등", "연기금"]:
-                                if inv in df_vol.index:
-                                    result["pension_buy"] = round(
-                                        float(df_vol.loc[inv, 순매수_col] or 0) * price / 1e8, 1)
-                                    break
-                            if "기관합계" in df_vol.index:
-                                result["inst_buy"] = round(
-                                    float(df_vol.loc["기관합계", 순매수_col] or 0) * price / 1e8, 1)
+                            if result["foreign_buy"] is None:
+                                for inv in ["외국인합계", "외국인"]:
+                                    if inv in df_sum.index:
+                                        result["foreign_buy"] = round(
+                                            float(df_sum.loc[inv, 순매수_col] or 0) / 1e8, 1)
+                                        break
+                            if result["pension_buy"] is None:
+                                for inv in ["연기금 등", "연기금등", "연기금"]:
+                                    if inv in df_sum.index:
+                                        result["pension_buy"] = round(
+                                            float(df_sum.loc[inv, 순매수_col] or 0) / 1e8, 1)
+                                        break
+                            if result["inst_buy"] is None:
+                                if "기관합계" in df_sum.index:
+                                    result["inst_buy"] = round(
+                                        float(df_sum.loc["기관합계", 순매수_col] or 0) / 1e8, 1)
                             result["net_buy"] = round(
                                 (result["foreign_buy"] or 0) + (result["inst_buy"] or 0), 1)
                 except Exception:
                     pass
-        except Exception:
-            pass
+
+                # 방법A-2: 날짜별 순매수 (연속일수 계산)
+                try:
+                    df_daily = _s.get_market_trading_value_by_date(strt10, end, code, on="순매수")
+                    if df_daily is not None and not df_daily.empty:
+                        col_f = next((c for c in df_daily.columns if "외국인" in c), None)
+                        col_i = next((c for c in df_daily.columns if "기관" in c), None)
+                        if result["consec_days"] == 0 and (col_f or col_i):
+                            consec = 0
+                            for _, row in df_daily.iloc[::-1].iterrows():
+                                f_val = float(row[col_f] if col_f else 0 or 0)
+                                i_val = float(row[col_i] if col_i else 0 or 0)
+                                if f_val > 0 or i_val > 0:
+                                    consec += 1
+                                else:
+                                    break
+                            result["consec_days"] = consec
+                except Exception:
+                    pass
+
+                # 방법B 폴백: 거래량 × 현재가 근사 (방법A 완전 실패 시)
+                if result["foreign_buy"] is None and price and price > 0:
+                    try:
+                        df_vol = _s.get_market_trading_volume_by_investor(strt5, end, code)
+                        if df_vol is not None and not df_vol.empty:
+                            순매수_col = next((c for c in df_vol.columns if "순매수" in c), None)
+                            if 순매수_col:
+                                for inv in ["외국인합계", "외국인"]:
+                                    if inv in df_vol.index:
+                                        result["foreign_buy"] = round(
+                                            float(df_vol.loc[inv, 순매수_col] or 0) * price / 1e8, 1)
+                                        break
+                                for inv in ["연기금 등", "연기금등", "연기금"]:
+                                    if inv in df_vol.index:
+                                        result["pension_buy"] = round(
+                                            float(df_vol.loc[inv, 순매수_col] or 0) * price / 1e8, 1)
+                                        break
+                                if "기관합계" in df_vol.index:
+                                    result["inst_buy"] = round(
+                                        float(df_vol.loc["기관합계", 순매수_col] or 0) * price / 1e8, 1)
+                                result["net_buy"] = round(
+                                    (result["foreign_buy"] or 0) + (result["inst_buy"] or 0), 1)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # 데몬 스레드로 실행 → 10초 내 완료 안 되면 건너뜀 (프로그램 멈춤 방지)
+        _t = _th.Thread(target=_do_investor_fetch, daemon=True)
+        _t.start()
+        _t.join(timeout=10)
+        # 타임아웃 시 result 값은 None/0 유지 → 아래 네이버 폴백으로 이어짐
 
     # ① 폴백: 네이버 금융 investor.naver 스크래핑
     # pykrx 투자자 API 전체 실패 시 사용
@@ -1718,10 +1719,14 @@ def _apply_supply_scores_batch(stocks: list, label: str = "", max_workers: int =
     추가 필드: foreign_buy, pension_buy, inst_buy, net_buy,
               vol_ratio, consec_days, price_up_days,
               grade, is_strong, 수급코멘트
+    개별 스레드 타임아웃 45초 — 네트워크 지연으로 인한 무한 대기 방지
     """
+    from concurrent.futures import TimeoutError as _FuturesTimeout
+
     if not stocks:
         return stocks
-    print(f"  [{label}] 수급강도 체크 중 ({len(stocks)}개)...", flush=True)
+    total = len(stocks)
+    print(f"  [{label}] 수급강도 체크 중 ({total}개)...", flush=True)
 
     def _fetch(c):
         s = get_supply_strength(c["code"], c["현재가"])
@@ -1738,10 +1743,34 @@ def _apply_supply_scores_batch(stocks: list, label: str = "", max_workers: int =
         c["수급코멘트"]    = s.get("label",     "")
         return c
 
+    result = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        result = list(ex.map(_fetch, stocks))
+        futs = [ex.submit(_fetch, s) for s in stocks]
+        done_cnt = 0
+        for fut, orig in zip(futs, stocks):
+            try:
+                result.append(fut.result(timeout=45))
+            except _FuturesTimeout:
+                # 타임아웃: 수급 데이터 없이 원본 유지
+                c = dict(orig)
+                c.setdefault("foreign_buy",   0)
+                c.setdefault("pension_buy",   0)
+                c.setdefault("inst_buy",      0)
+                c.setdefault("net_buy",       0)
+                c.setdefault("vol_ratio",     0)
+                c.setdefault("consec_days",   0)
+                c.setdefault("price_up_days", 0)
+                c.setdefault("수급등급",      "")
+                c.setdefault("is_strong",     False)
+                c.setdefault("수급코멘트",    "")
+                result.append(c)
+            except Exception:
+                result.append(orig)
+            done_cnt += 1
+            if done_cnt % 20 == 0 or done_cnt == total:
+                print(f"  [{label}] 진행: {done_cnt}/{total}", flush=True)
 
-    grade_cnt = {g: sum(1 for c in result if c["수급등급"] == g)
+    grade_cnt = {g: sum(1 for c in result if c.get("수급등급") == g)
                  for g in ("★★★", "★★", "★")}
     print(f"  [{label}] 완료 — "
           f"★★★:{grade_cnt['★★★']}개 ★★:{grade_cnt['★★']}개 ★:{grade_cnt['★']}개")
