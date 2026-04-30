@@ -1682,13 +1682,71 @@ def _is_dividend_stock(ann_dps_5y: list, dps_last: float, price: float,
     return is_div, round(div_yield * 100, 1), years_with_div
 
 
+def _fast_supply_from_cache(stocks: list) -> list:
+    """
+    OHLCV 호출 없이 배치 캐시(_SUPPLY_CACHE)만으로 수급등급 계산.
+    _load_market_supply_batch() 실행 후 호출 — 즉시 완료.
+    foreign_buy / pension_buy / consec_days 기반 간이 등급:
+      ★★★: 외+연 동반 AND 연속3일↑
+      ★★ : 외+기관 동반 AND 연속2일↑
+      ★  : 외 OR 연 순매수
+    vol_ratio / price_up_days 는 None으로 채움 (OHLCV 미수집)
+    최종 후보(성장주·배당주)는 _apply_supply_scores_batch로 재계산됨.
+    """
+    result = []
+    for s in stocks:
+        code  = s["code"]
+        cached = _SUPPLY_CACHE.get(code, {})
+        f  = cached.get("foreign_buy") or 0
+        p  = cached.get("pension_buy") or 0
+        i  = cached.get("inst_buy")    or 0
+        cd = cached.get("consec_days") or 0
+        sr = cached.get("short_ratio") or 0
+
+        f_pos = f > 0;  p_pos = p > 0;  i_pos = i > 0
+
+        if   f_pos and p_pos and cd >= 3: grade = "★★★"
+        elif f_pos and i_pos and cd >= 2: grade = "★★"
+        elif f_pos or  p_pos:             grade = "★"
+        else:                             grade = ""
+
+        if sr >= 10 and grade in ("★★★","★★"): grade = "★"
+        elif sr >= 5 and grade == "★★★":        grade = "★★"
+
+        parts = []
+        if f: parts.append(f"외국인{f:+.0f}억")
+        if p: parts.append(f"연기금{p:+.0f}억")
+        if cd > 0: parts.append(f"연속{cd}일")
+        label_str = (f"{grade} " if grade else "") + "/".join(parts)
+
+        c2 = dict(s)
+        c2.update({
+            "foreign_buy":   f,
+            "pension_buy":   p,
+            "inst_buy":      i,
+            "net_buy":       round(f + i, 1),
+            "vol_ratio":     None,
+            "consec_days":   cd,
+            "price_up_days": 0,
+            "short_ratio":   sr,
+            "수급등급":      grade,
+            "is_strong":     grade in ("★★", "★★★"),
+            "수급코멘트":    label_str,
+        })
+        result.append(c2)
+    strong = sum(1 for c in result if c.get("is_strong"))
+    print(f"  [수급빠른계산] {len(result)}개 완료 — ★★+: {strong}개")
+    return result
+
+
 def _apply_supply_scores_batch(stocks: list, label: str = "", max_workers: int = 15) -> list:
     """
-    수급강도 병렬 체크 후 각 dict에 결과 추가
+    수급강도 병렬 체크 후 각 dict에 결과 추가 (OHLCV 포함 전체 계산)
     추가 필드: foreign_buy, pension_buy, inst_buy, net_buy,
               vol_ratio, consec_days, price_up_days,
               grade, is_strong, 수급코멘트
     개별 스레드 타임아웃 45초 — 네트워크 지연으로 인한 무한 대기 방지
+    최종 후보(성장주 top100 + 배당주)에만 사용. 전종목 배치는 _fast_supply_from_cache 사용.
     """
     from concurrent.futures import TimeoutError as _FuturesTimeout
 
@@ -2326,9 +2384,10 @@ def run_full(stage2: bool = True):
     stage1_list = run_stage1(tickers, ev_map=ev_map, sector_map=sector_map)
     print(f"\n  [1단계 완료] {len(stage1_list)}개 통과")
 
-    # ── 수급 배치: 1단계 전종목 대상 (수급강한종목 섹션 생성에 필요)
-    print(f"\n  [수급배치] 1단계 통과 전종목 수급강도 체크 ({len(stage1_list)}개)...")
-    stage1_with_supply = _apply_supply_scores_batch(stage1_list, "전체", max_workers=20)
+    # ── 수급 빠른 계산: 1단계 전종목 (배치 캐시만 사용, OHLCV 없음)
+    # 목적: 수급강한종목 섹션 식별. OHLCV는 최종 후보에서 별도 수행.
+    print(f"\n  [수급빠른계산] 1단계 통과 {len(stage1_list)}개 배치 캐시 기반 등급 계산...")
+    stage1_with_supply = _fast_supply_from_cache(stage1_list)
     supply_map = {s["code"]: s for s in stage1_with_supply}   # code → 수급 dict
 
     # ── 2단계: _srim_python 병렬 계산 (전체 대상)
@@ -2392,6 +2451,30 @@ def run_full(stage2: bool = True):
     for r in growth_top100:
         if not r.get("분류"):
             r["분류"] = "성장주"
+
+    # ── OHLCV 상세 수급: 최종 후보(성장주+배당주)만 계산 (수백 개 수준으로 관리 가능)
+    final_candidates = growth_top100 + dividend_stocks
+    if final_candidates:
+        n_detail = len(final_candidates)
+        print(f"\n  [수급상세] 최종 후보 {n_detail}개 OHLCV 수급 체크 (거래량비율 포함)...")
+        detailed = _apply_supply_scores_batch(final_candidates, "최종후보", max_workers=15)
+        # 상세 데이터로 supply_map 업데이트
+        for s in detailed:
+            supply_map[s["code"]] = s
+        # growth_top100 / dividend_stocks 에 상세 수급 반영
+        detail_map = {s["code"]: s for s in detailed}
+        growth_top100   = [detail_map.get(r["code"], r) for r in growth_top100]
+        dividend_stocks = [detail_map.get(r["code"], r) for r in dividend_stocks]
+        # 상세 수급으로 재정렬
+        growth_top100.sort(key=_supply_sort_key)
+        dividend_stocks.sort(key=_supply_sort_key)
+        # 수급강한종목도 상세 데이터 반영
+        for s in strong_stocks:
+            if s["code"] in detail_map:
+                s.update({k: detail_map[s["code"]][k]
+                           for k in ("vol_ratio","price_up_days","수급등급","is_strong","수급코멘트")
+                           if detail_map[s["code"]].get(k) is not None})
+        strong_stocks.sort(key=_supply_sort_key)
 
     print(f"  [3단계 분류] 성장주 {len(growth_top100)}개 / 배당주 {len(dividend_stocks)}개 / 수급강한종목 {len(strong_stocks)}개")
 
