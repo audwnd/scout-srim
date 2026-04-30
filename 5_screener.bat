@@ -5,28 +5,22 @@ set PY=C:\Users\rlaau\AppData\Local\Programs\Python\Python310\python.exe
 
 echo.
 echo ==================================================
-echo   RIM Screening
+echo   S-RIM 스크리닝 v3
 echo ==================================================
 echo.
-echo  [1] All undervalued
-echo  [2] More than 10%% undervalued
-echo  [3] More than 20%% undervalued
-echo  [4] Stage 1 only (fast)
-echo  [5] Strict mode (consensus + ROE improving)
+echo  [1] 전체 실행 (1단계:재무 + 2단계:RIM + 3단계:수급)  (default)
+echo  [2] 1단계만 빠르게 (재무필터만, RIM 계산 생략)
 echo.
-set /p CHOICE=Select (1~5):
+echo  Press Enter for [1] default
+echo.
+set /p CHOICE=Select (1~2, Enter=1):
 
 if "%CHOICE%"=="2" (
-    "%PY%" rim_screener.py --pct -10
-) else if "%CHOICE%"=="3" (
-    "%PY%" rim_screener.py --pct -20
-) else if "%CHOICE%"=="4" (
-    "%PY%" rim_screener.py --pct 0 --stage1
-) else if "%CHOICE%"=="5" (
-    "%PY%" rim_screener.py --pct 0 --strict
+    "%PY%" rim_screener.py --stage1
 ) else (
-    "%PY%" rim_screener.py --pct 0
+    "%PY%" rim_screener.py
 )
 
 echo.
-pause
+echo Screening done. Type EXIT to close this window.
+cmd /k
