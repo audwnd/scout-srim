@@ -1771,7 +1771,11 @@ def _apply_supply_scores_batch(stocks: list, label: str = "", max_workers: int =
         return c
 
     result = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    # shutdown(wait=False, cancel_futures=True) 사용:
+    # fut.result(timeout=45) 타임아웃된 스레드가 백그라운드에서 계속 실행되더라도
+    # with 블록 종료 시 무한 대기하지 않음 (Python 3.9+)
+    ex = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futs = [ex.submit(_fetch, s) for s in stocks]
         done_cnt = 0
         for fut, orig in zip(futs, stocks):
@@ -1796,6 +1800,8 @@ def _apply_supply_scores_batch(stocks: list, label: str = "", max_workers: int =
             done_cnt += 1
             if done_cnt % 20 == 0 or done_cnt == total:
                 print(f"  [{label}] 진행: {done_cnt}/{total}", flush=True)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)   # 잔여 스레드 대기 안 함
 
     grade_cnt = {g: sum(1 for c in result if c.get("수급등급") == g)
                  for g in ("★★★", "★★", "★")}
@@ -2071,7 +2077,8 @@ def run_stage2(candidates: list, ke: float, max_workers: int = 20) -> list:
             return c2
 
     results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    ex = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futs = {ex.submit(_process_one, c): c for c in candidates}
         done_cnt = 0
         for fut in as_completed(futs):
@@ -2099,6 +2106,8 @@ def run_stage2(candidates: list, ke: float, max_workers: int = 20) -> list:
                 c2["stage"] = 2
                 results.append(c2)
                 print(f"  [{done_cnt}/{total}] {orig.get('name','?')} ✗ {c2['error']}", flush=True)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)   # 잔여 스레드 대기 안 함
 
     elapsed = (datetime.now() - start).total_seconds()
     ok = sum(1 for r in results if r.get("적정주가", 0) > 0)
